@@ -31,7 +31,21 @@ impl Decoder for PcmDecoder {
             return Ok(());
         };
         let data = p.data();
-        let bytes_per_sample = self.ctx.sample_fmt.bytes_per_sample().max(1);
+        let sample_fmt = match self.ctx.codec_id {
+            CodecId::PcmU8 => SampleFormat::U8,
+            CodecId::PcmS16le | CodecId::PcmS16be => SampleFormat::S16,
+            CodecId::PcmS24le | CodecId::PcmS24be | CodecId::PcmS32le | CodecId::PcmS32be => SampleFormat::S32,
+            CodecId::PcmF32le | CodecId::PcmF32be => SampleFormat::Flt,
+            CodecId::PcmF64le | CodecId::PcmF64be => SampleFormat::Dbl,
+            _ => {
+                if self.ctx.sample_fmt != SampleFormat::None {
+                    self.ctx.sample_fmt
+                } else {
+                    SampleFormat::S16
+                }
+            }
+        };
+        let bytes_per_sample = sample_fmt.bytes_per_sample().max(1);
         let channels = self.ctx.ch_layout.nb_channels.max(1) as usize;
         let nb_samples = data.len() / (bytes_per_sample * channels);
 
@@ -41,9 +55,9 @@ impl Decoder for PcmDecoder {
 
         let mut frame = Frame::alloc_audio(
             nb_samples,
-            self.ctx.sample_rate,
+            self.ctx.sample_rate.max(8000),
             self.ctx.ch_layout,
-            self.ctx.sample_fmt,
+            sample_fmt,
         )?;
         frame.pts = p.pts;
 
