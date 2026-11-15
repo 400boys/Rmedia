@@ -1,0 +1,18 @@
+[package]
+name = "rff-format-png"
+description = "Remade FFmpeg (Rust): PNG single-image container (file = codec stream)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["png", "container", "image", "demuxer", "muxer"]
+categories = ["multimedia", "multimedia::images", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rusty_png.workspace = true

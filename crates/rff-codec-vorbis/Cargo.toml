@@ -1,0 +1,31 @@
+[package]
+name = "rff-codec-vorbis"
+description = "Remade FFmpeg (Rust): Vorbis codec adapter — the pure-Rust rusty_vorbis decoder and encoder (no C/FFI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["vorbis", "ogg", "audio", "decoder", "encoder"]
+categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
+
+[features]
+# `simd` (default) enables rusty_vorbis's runtime-detected AVX2 residue-VQ distance
+# kernel on x86_64 — a bit-exact `unsafe` block (no FMA, so it's byte-identical to
+# the scalar path) with a scalar fallback. `--no-default-features` gives a
+# 100%-safe scalar build.
+default = ["simd"]
+simd = ["rusty_vorbis/simd"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rusty_vorbis.workspace = true
+
+# lewton is only the decode oracle for the encoder round-trip gates
+# (tests/encoder_lewton.rs); the shipping decoder is rusty_vorbis.
+[dev-dependencies]
+lewton.workspace = true

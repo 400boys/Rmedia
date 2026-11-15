@@ -1,0 +1,18 @@
+[package]
+name = "rff-codec-flac"
+description = "Remade FFmpeg (Rust): FLAC lossless audio decoder."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["flac", "lossless", "audio", "codec", "encoder"]
+categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rusty_flac.workspace = true

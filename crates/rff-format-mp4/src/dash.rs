@@ -1,0 +1,343 @@
+//! DASH VOD output: fMP4 init + media segments plus a static `.mpd` manifest.
+//!
+//! `rff -i in.mp4 -c:v h264 -c:a aac out.mpd` writes, next to `out.mpd`:
+//! `init-stream0.m4s`, `chunk-stream0-00001.m4s`, … one set per stream, and a
+//! `static` manifest with one AdaptationSet per stream and an exact
+//! SegmentTimeline. Fragments cut on video keyframes once `-seg_duration`
+//! seconds have accumulated (audio cuts purely by time).
+//!
+//! Everything is buffered until the trailer (VOD; the same policy as the MP4
+//! muxer) so durations and the timeline are exact, not estimated.
+
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use rff_core::{CodecId, Error, MediaType, Packet, Result};
+use rff_format::avc::{build_avcc_record, split_annexb};
+use rff_format::{Muxer, Stream};
+
+use super::fmp4::{self, FragSample};
+use super::{bx, mp4_fourcc, timing_plan, TrackOut};
+
+/// One output stream's buffered samples + fragmenting state.
+struct DashTrack {
+    /// The track description, and each sample's packet pts/dts (its `pts` and
+    /// `dts`), from which [`timing_plan`] times the fragments exactly as the
+    /// plain MP4 muxer times `stts`/`ctts`/`elst`.
+    out: TrackOut,
+    /// Buffered `(data, keyframe)` — AVCC-converted for H.264.
+    samples: Vec<(Vec<u8>, bool)>,
+}
+
+pub struct DashMuxer {
+    dir: PathBuf,
+    mpd_path: PathBuf,
+    seg_seconds: f64,
+    tracks: Vec<DashTrack>,
+}
+
+impl DashMuxer {
+    pub fn new(mpd_path: &Path, seg_seconds: f64) -> Result<DashMuxer> {
+        Ok(DashMuxer {
+            dir: mpd_path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            mpd_path: mpd_path.to_path_buf(),
+            seg_seconds: seg_seconds.clamp(0.5, 60.0),
+            tracks: Vec::new(),
+        })
+    }
+}
+
+impl Muxer for DashMuxer {
+    fn write_header(&mut self, streams: &[Stream]) -> Result<()> {
+        if streams.is_empty() {
+            return Err(Error::invalid("dash mux: no streams"));
+        }
+        for s in streams {
+            // One source of truth with the plain MP4 muxer: same mapping, same
+            // refusal, so `.mpd` and `.mp4` never disagree about what is legal.
+            let fourcc = mp4_fourcc(s)?;
+            self.tracks.push(DashTrack {
+                out: TrackOut::new(s, fourcc),
+                samples: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        let Some(track) = self.tracks.get_mut(packet.stream_index) else {
+            return Err(Error::invalid(format!(
+                "dash mux: packet for unknown stream {}",
+                packet.stream_index
+            )));
+        };
+        // Same normalisation as the plain MP4 muxer: H.264 Annex-B → AVCC with
+        // the avcC hoisted; AV1 harvests its config from the first packet.
+        let data = if track.out.stream.codec_id == CodecId::H264 {
+            let mut sample = Vec::new();
+            let (mut sps, mut pps) = (None, None);
+            for nal in split_annexb(&packet.data) {
+                match nal.first().map(|b| b & 0x1F) {
+                    Some(7) => sps = Some(nal.to_vec()),
+                    Some(8) => pps = Some(nal.to_vec()),
+                    _ => {
+                        sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                        sample.extend_from_slice(nal);
+                    }
+                }
+            }
+            if track.out.config.is_none() {
+                if let (Some(s), Some(p)) = (&sps, &pps) {
+                    track.out.config = Some(bx(b"avcC", &build_avcc_record(s, p)));
+                }
+            }
+            sample
+        } else {
+            if track.out.stream.codec_id == CodecId::Avif && track.out.config.is_none() {
+                track.out.config =
+                    rff_format::av1::config_record(&packet.data).map(|r| bx(b"av1C", &r));
+            }
+            packet.data.clone()
+        };
+        track.samples.push((data, packet.flags.keyframe));
+        track.out.pts.push(packet.pts);
+        track.out.dts.push(packet.dts);
+        Ok(())
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        let mut manifest_parts = Vec::new();
+        let mut presentation_secs = 0f64;
+
+        for (id, track) in self.tracks.iter_mut().enumerate() {
+            // Decode durations, composition offsets and the presentation start
+            // (edit list), by the same rule as the plain MP4 muxer (#84):
+            // B-frames keep their display order.
+            let plan = timing_plan(&track.out);
+            let ts = plan.timescale.max(1);
+            let durations = &plan.durations;
+            let is_video = track.out.stream.media_type == MediaType::Video;
+
+            // --- init segment ---
+            let init_name = format!("init-stream{id}.m4s");
+            let init = fmp4::init_segment(&track.out, id as u32 + 1, ts, plan.start);
+            fs::write(self.dir.join(&init_name), init)?;
+
+            // --- cut fragments: video on keyframes, both by elapsed time ---
+            let target_ticks = (self.seg_seconds * ts as f64) as i64;
+            let mut fragments: Vec<Vec<FragSample>> = Vec::new();
+            let mut current: Vec<FragSample> = Vec::new();
+            let mut current_ticks = 0i64;
+            for (i, (data, keyframe)) in track.samples.iter().enumerate() {
+                let due = current_ticks >= target_ticks;
+                let cut = !current.is_empty() && due && (*keyframe || !is_video);
+                if cut {
+                    fragments.push(std::mem::take(&mut current));
+                    current_ticks = 0;
+                }
+                current.push(FragSample {
+                    data: data.clone(),
+                    keyframe: *keyframe,
+                    duration: durations[i],
+                });
+                current_ticks += durations[i] as i64;
+            }
+            if !current.is_empty() {
+                fragments.push(current);
+            }
+
+            // --- media segments + exact timeline ---
+            let mut timeline = Vec::new(); // (start_ticks, dur_ticks)
+            let mut base_time = 0u64;
+            let mut first = 0usize; // track index of the fragment's first sample
+            for (n, frag) in fragments.iter().enumerate() {
+                let name = format!("chunk-stream{id}-{:05}.m4s", n + 1);
+                // This fragment's slice of the track's composition offsets.
+                let offsets = (!plan.offsets.is_empty())
+                    .then(|| &plan.offsets[first.min(plan.offsets.len())..]);
+                first += frag.len();
+                let seg = fmp4::media_segment_with_offsets(
+                    n as u32 + 1,
+                    id as u32 + 1,
+                    base_time,
+                    frag,
+                    offsets,
+                );
+                fs::write(self.dir.join(&name), seg)?;
+                let dur: u64 = frag.iter().map(|s| s.duration as u64).sum();
+                timeline.push((base_time, dur));
+                base_time += dur;
+            }
+            // What is shown: from the edit's start to the last frame's end.
+            presentation_secs = presentation_secs.max(plan.presentation as f64 / ts as f64);
+
+            // --- Representation XML ---
+            let s = &track.out.stream;
+            let mime = fmp4::mime_type(s.media_type);
+            let codecs = fmp4::codec_string(&track.out);
+            let mut rep = String::new();
+            let _ = writeln!(
+                rep,
+                "    <AdaptationSet mimeType=\"{mime}\" segmentAlignment=\"true\">"
+            );
+            let _ = write!(
+                rep,
+                "      <Representation id=\"{id}\" codecs=\"{codecs}\" bandwidth=\"200000\""
+            );
+            if is_video && s.width > 0 {
+                let _ = write!(rep, " width=\"{}\" height=\"{}\"", s.width, s.height);
+            }
+            if s.media_type == MediaType::Audio && s.sample_rate > 0 {
+                let _ = write!(rep, " audioSamplingRate=\"{}\"", s.sample_rate);
+            }
+            let _ = writeln!(rep, ">");
+            let _ = writeln!(
+                rep,
+                "        <SegmentTemplate timescale=\"{ts}\" initialization=\"init-stream{id}.m4s\" media=\"chunk-stream{id}-$Number%05d$.m4s\" startNumber=\"1\">"
+            );
+            let _ = writeln!(rep, "          <SegmentTimeline>");
+            for (start, dur) in &timeline {
+                let _ = writeln!(rep, "            <S t=\"{start}\" d=\"{dur}\"/>");
+            }
+            let _ = writeln!(rep, "          </SegmentTimeline>");
+            let _ = writeln!(rep, "        </SegmentTemplate>");
+            let _ = writeln!(rep, "      </Representation>");
+            let _ = writeln!(rep, "    </AdaptationSet>");
+            manifest_parts.push(rep);
+        }
+
+        // --- manifest ---
+        let mut mpd = String::new();
+        let _ = writeln!(mpd, "<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+        let _ = writeln!(
+            mpd,
+            "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" profiles=\"urn:mpeg:dash:profile:isoff-main:2011\" type=\"static\" mediaPresentationDuration=\"PT{presentation_secs:.3}S\" minBufferTime=\"PT{:.1}S\">",
+            self.seg_seconds
+        );
+        let _ = writeln!(mpd, "  <Period start=\"PT0S\">");
+        for part in &manifest_parts {
+            mpd.push_str(part);
+        }
+        let _ = writeln!(mpd, "  </Period>");
+        let _ = writeln!(mpd, "</MPD>");
+        fs::write(&self.mpd_path, mpd)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rff_core::Rational;
+
+    /// What packaging one H.264 track gave: the init segment, the first
+    /// media segment and the manifest.
+    struct Packaged {
+        init: Vec<u8>,
+        segment: Vec<u8>,
+        mpd: String,
+    }
+
+    /// Package an H.264 track of `(pts, dts)` packets (ms) as DASH, in a
+    /// scratch directory of its own.
+    fn package(name: &str, packets: &[(i64, Option<i64>)]) -> Packaged {
+        let dir = std::env::temp_dir().join(format!("rff-dash-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mpd = dir.join("out.mpd");
+        let mut mux = DashMuxer::new(&mpd, 4.0).unwrap();
+        let mut s = Stream::new(0, CodecId::H264);
+        s.media_type = MediaType::Video;
+        s.time_base = Rational::new(1, 1000);
+        mux.write_header(&[s]).unwrap();
+        for (i, &(pts, dts)) in packets.iter().enumerate() {
+            let nal = if i == 0 { 0x65 } else { 0x41 };
+            let mut p = Packet::from_data(0, vec![0, 0, 0, 1, nal, i as u8]);
+            p.pts = Some(pts);
+            p.dts = dts;
+            p.flags.keyframe = i == 0;
+            mux.write_packet(&p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+        let read = |f: &str| fs::read(dir.join(f)).unwrap();
+        let out = Packaged {
+            init: read("init-stream0.m4s"),
+            segment: read("chunk-stream0-00001.m4s"),
+            mpd: fs::read_to_string(&mpd).unwrap(),
+        };
+        let _ = fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// The payload of the first `typ` box in `buf` (header skipped).
+    fn payload<'a>(buf: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
+        let pos = buf.windows(4).position(|w| w == typ)?;
+        let size = u32::from_be_bytes(buf[pos - 4..pos].try_into().unwrap()) as usize;
+        Some(&buf[pos + 4..pos - 4 + size])
+    }
+
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    /// #88: B-frames keep their display order. Durations come from decode
+    /// times, each `trun` entry carries pts - dts, and the init segment's
+    /// edit list starts presentation after the reorder delay.
+    #[test]
+    fn b_frames_get_decode_durations_composition_offsets_and_an_edit_list() {
+        // Decode order I P B B B, shown 0 160 80 40 120, decoded from -80.
+        let out = package(
+            "bframes",
+            &[
+                (0, Some(-80)),
+                (160, Some(-40)),
+                (80, Some(0)),
+                (40, Some(40)),
+                (120, Some(80)),
+            ],
+        );
+        let trun = payload(&out.segment, b"trun").unwrap();
+        // Version 0 (no negative offset); data offset + duration, size,
+        // flags and composition offset per sample.
+        assert_eq!(&trun[..4], &[0, 0, 0x0F, 0x01]);
+        let w = words(&trun[4..]);
+        assert_eq!(w[0], 5); // sample_count
+        let entries: Vec<&[u32]> = w[2..].chunks(4).collect();
+        assert!(entries.iter().all(|e| e[0] == 40));
+        let cts: Vec<u32> = entries.iter().map(|e| e[3]).collect();
+        assert_eq!(cts, [80, 200, 80, 0, 40]);
+        // elst: one entry, segment_duration 0 (the rest), media_time 80.
+        let elst = words(payload(&out.init, b"elst").unwrap());
+        assert_eq!(elst, [0, 1, 0, 80, 0x0001_0000]);
+        assert!(out.mpd.contains("mediaPresentationDuration=\"PT0.200S\""));
+    }
+
+    /// Without DTS (a Matroska source) the decode times are derived from
+    /// the PTS, as in the plain MP4 muxer.
+    #[test]
+    fn b_frames_without_dts_derive_their_decode_times() {
+        let out = package(
+            "nodts",
+            &[(0, None), (80, None), (40, None), (160, None), (120, None)],
+        );
+        let w = words(&payload(&out.segment, b"trun").unwrap()[4..]);
+        let cts: Vec<u32> = w[2..].chunks(4).map(|e| e[3]).collect();
+        assert_eq!(cts, [40, 80, 0, 80, 0]);
+        assert_eq!(words(payload(&out.init, b"elst").unwrap())[3], 40);
+    }
+
+    /// In-order frames write exactly what they did before #88: no
+    /// composition offsets, no edit list.
+    #[test]
+    fn in_order_frames_write_no_offsets_or_edit_list() {
+        let out = package("inorder", &[(0, Some(0)), (40, Some(40)), (80, Some(80))]);
+        let trun = payload(&out.segment, b"trun").unwrap();
+        assert_eq!(&trun[..4], &[0, 0, 0x07, 0x01]);
+        assert_eq!(trun.len(), 4 + 4 + 4 + 3 * 12);
+        assert!(payload(&out.init, b"edts").is_none());
+        assert!(out.mpd.contains("mediaPresentationDuration=\"PT0.120S\""));
+    }
+}

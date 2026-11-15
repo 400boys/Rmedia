@@ -1,0 +1,30 @@
+[package]
+name = "rff-codec-vp9"
+description = "Remade FFmpeg (Rust): VP9 codec, backed by the in-house pure-Rust rusty_vp9 engine (no C/FFI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["vp9", "video", "codec", "decoder", "encoder"]
+categories = ["multimedia", "multimedia::video", "multimedia::encoding"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rusty_vp9.workspace = true
+
+[dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true
+# Benchmark uses internal crates only — no third-party harness — so it adds
+# nothing to the dependency / license graph.
+rff-core.workspace = true
+rff-codec.workspace = true
+
+[[bench]]
+name = "vp9_decode"
+harness = false

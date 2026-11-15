@@ -1,0 +1,98 @@
+# cargo-deny configuration — enforces the "no copyleft" promise from the README.
+# Run in CI with:  cargo deny check licenses bans
+#
+# Any license NOT in `allow` causes a hard failure, so GPL/LGPL/AGPL/MPL can
+# never sneak into the dependency tree.
+
+[graph]
+# Scope the gate to the embeddable core (library, CLI, server, codecs, formats).
+# `rff-ui` is the optional Dioxus front-end — built on demand, never part of the
+# core or the published binaries — and it transitively pulls MPL-2.0 crates via
+# wry/servo. Excluding it drops its unique subtree, so the license promise is
+# enforced everywhere it actually applies. The UI's own licensing is tracked
+# separately (see docs/architecture.md).
+exclude = ["rff-ui"]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # University of Illinois/NCSA Open Source License — BSD-style, permissive,
+    # OSI-approved and FSF-Free (NOT copyleft). Reaches us via libfuzzer-sys in
+    # rav1e's tree.
+    "NCSA",
+    # Independent JPEG Group license — the permissive libjpeg license (NOT
+    # copyleft); the `jpeg-encoder` crate reimplements IJG's algorithms in Rust.
+    "IJG",
+]
+
+[bans]
+# Explicit belt-and-suspenders deny list for copyleft families, in case one is
+# ever added to `allow` by mistake.
+deny = []
+multiple-versions = "warn"
+
+[advisories]
+yanked = "deny"
+# `paste` (RUSTSEC-2024-0436) is flagged *unmaintained*, not vulnerable — a
+# stable proc-macro pulled in transitively (via rav1e / codec deps) with no
+# known security issue and no drop-in replacement under our control.
+# Acknowledge it explicitly; revisit if the upstreams migrate off it.
+#
+# The seven below ALL originate from `rustls-rustcrypto 0.0.2-alpha` — the pure-Rust
+# (ring-free) crypto provider behind the *opt-in, experimental* HTTPS input stack.
+# It is present only under `--all-features` (never in the default build), is the
+# LATEST published version, and pins the affected transitive crates, so there is no
+# upstream fix to take today (a `[patch]` to newer webpki would break its API):
+#   * RUSTSEC-2023-0071 — `rsa` "Marvin" RSA timing sidechannel. No fixed `rsa`
+#     release exists, and it is not in a practical attack path here (we don't run
+#     attacker-probed RSA operations when fetching HTTPS media).
+#   * RUSTSEC-2026-0049/0098/0099/0104 — `rustls-webpki 0.102` cert-path bugs (CRL
+#     matching, URI/wildcard name constraints, a reachable panic in CRL parsing).
+#   * RUSTSEC-2026-0382 — distrusted emSign intermediates accepted in cert paths.
+#     Fixed in 0.103.16, which the lock now pins (that is the copy `rustls` uses
+#     to verify certificates). The 0.102.8 copy is only `rustls-rustcrypto`'s,
+#     and it uses nothing from it but the `alg_id` constants -- never path
+#     building -- so the vulnerable code is linked but not reachable.
+#   * RUSTSEC-2026-0387 -- crypto-bigint 0.5.5 timing variability in operations
+#     meant to be constant-time. Reached via p256/ecdsa/elliptic-curve from
+#     rustls-rustcrypto, which pins it (no fixed 0.5.x exists). Unlike the
+#     webpki ones this IS reachable in principle: P-256 ECDHE in a TLS
+#     handshake runs on an ephemeral secret, so a network timing attacker could
+#     in theory probe it. Accepted on the same terms as RSA "Marvin" above:
+#     opt-in experimental HTTPS input only, ephemeral keys, no long-term secret
+#     handled; never in the default build or the published binaries' default
+#     features. TRACK with the provider replacement.
+# Accepted ONLY for the experimental HTTPS feature. TRACK: update/replace
+# `rustls-rustcrypto` (or swap the crypto provider) to clear these.
+ignore = [
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0387",
+]
+
+[sources]
+# Every crate must come from crates.io, with ONE deliberate exception: the
+# workspace `[patch.crates-io]` swaps `serde_json` for the house fork
+# (Remade-With-Rust/rusty_json_turbo, see the root Cargo.toml), which resolves
+# from git. That exact repository is allowed and nothing else -- any other git
+# dependency, or an unvetted registry, stays a hard failure instead of a silent
+# drift (use-protection-please H-08/H-13).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/Remade-With-Rust/rusty_json_turbo"]

@@ -1,0 +1,103 @@
+[package]
+# Published as `remade-ffmpeg`: the short name `rff` is owned by an
+# unrelated crate on crates.io. The library is still `rff`, so downstream
+# code reads `use rff::...` exactly as the docs and READMEs show.
+name = "remade-ffmpeg"
+description = "Remade FFmpeg (Rust): the engine facade — registers built-in codecs/formats and exposes the high-level transcode & probe API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["ffmpeg", "transcode", "video", "audio", "codec"]
+categories = ["multimedia", "multimedia::encoding"]
+
+[lib]
+name = "rff"
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+rff-format.workspace = true
+rff-targets.workspace = true
+rff-filter.workspace = true
+rff-io.workspace = true
+rff-resample.workspace = true
+rff-codec-h264.workspace = true
+rff-codec-hevc.workspace = true
+rff-codec-opus.workspace = true
+rff-codec-avif.workspace = true
+rff-codec-png.workspace = true
+rff-codec-jpeg.workspace = true
+rff-codec-gif.workspace = true
+rff-codec-webp.workspace = true
+rff-codec-pcm.workspace = true
+rff-codec-vorbis.workspace = true
+rff-codec-flac.workspace = true
+rff-codec-jxl.workspace = true
+rff-codec-aac.workspace = true
+rff-codec-vp9.workspace = true
+rff-codec-av2.workspace = true
+rff-codec-mp3.workspace = true
+rff-codec-rawvideo.workspace = true
+rff-format-avi.workspace = true
+rff-format-avif.workspace = true
+rff-format-png.workspace = true
+rff-format-jpeg.workspace = true
+rff-format-gif.workspace = true
+rff-format-webp.workspace = true
+rff-format-wav.workspace = true
+rff-format-y4m.workspace = true
+rff-format-ivf.workspace = true
+rff-format-av2f.workspace = true
+rff-format-ogg.workspace = true
+rff-format-flac.workspace = true
+rff-format-mp3.workspace = true
+rff-format-jxl.workspace = true
+rff-format-mp4.workspace = true
+rff-format-mkv.workspace = true
+rff-format-ts.workspace = true
+rff-format-flv.workspace = true
+rff-format-hls.workspace = true
+rff-format-mjpeg.workspace = true
+rff-format-rtp.workspace = true
+rff-format-srt.workspace = true
+rff-format-ass.workspace = true
+rff-format-webvtt.workspace = true
+
+# TEMPORARY, opt-in only: Cisco openh264 (C/FFI). Off by default so the normal
+# build stays 100% Rust. Enable with `--features h264-openh264`.
+rff-codec-openh264 = { workspace = true, optional = true }
+
+[features]
+# H.264 defaults to rusty_h264 with its SIMD kernels on — substantially faster.
+# Since rusty_h264 0.10 those are portable Rust SIMD (SSE2/AVX2 on x86-64,
+# NEON on aarch64) in a single isolated crate: no assembler, no C, no `nasm`.
+# The feature keeps its historical name. Build with `--no-default-features`
+# for the pure scalar path.
+default = ["h264-asm"]
+h264-asm = ["rff-codec-h264/asm"]
+# Enable `https://` streaming input (rustls + RustCrypto provider, pure Rust).
+# Off by default; pulls the optional TLS dependency tree only when requested.
+https = ["rff-io/https"]
+# Working H.264 via the C openh264 library — an opt-in cross-check / fallback to
+# the default in-house pure-Rust codec. NOT pure Rust; needs a C toolchain.
+h264-openh264 = ["dep:rff-codec-openh264"]
+
+[dev-dependencies]
+# global allocator for bench/example roots (see project convention)
+rusty_alloc-api.workspace = true
+# MD5 (RustCrypto, MIT/Apache) — used only by the VP9 conformance harness to
+# match libvpx's per-frame I420 hashes. Dev-only; not in the shipped graph.
+md-5 = "0.10"
+# lewton's own Ogg reader: the decode oracle for the Ogg Vorbis tests.
+lewton.workspace = true
+
+# Document the scalar configuration (identical public API; nothing on docs.rs
+# runs the kernels), plus `https` so the TLS input path is covered.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["https"]

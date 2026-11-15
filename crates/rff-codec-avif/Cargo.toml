@@ -1,0 +1,35 @@
+[package]
+name = "rff-codec-avif"
+description = "Remade FFmpeg (Rust): AVIF still-image codec (AV1 intra frame)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["avif", "av1", "image", "codec", "encoder"]
+categories = ["multimedia", "multimedia::images", "multimedia::encoding"]
+
+[dependencies]
+rff-core.workspace = true
+rff-codec.workspace = true
+
+# AV1 encoder backing the AVIF encode path (rusty-av1-toolkit fork of rav1e).
+rusty_av1e.workspace = true
+# AV1 decoder backing the AVIF decode path (rusty-av1-toolkit fork of rav1d),
+# via its native safe Rust API (`rust_api`).
+rusty_av1d.workspace = true
+
+# Native targets get the full-speed AV1 build: nasm SIMD kernels + rayon
+# tile-threading (the same feature set video-tests/analyzer-av1 builds with;
+# CI already installs nasm on all three OS legs for the h264-asm path).
+# wasm32 stays on the base no-asm/no-threading build: the asm feature is
+# x86_64/aarch64-only, and rayon thread spawns panic on wasm at runtime
+# (same lesson as rusty_png's forced-serial DEFLATE).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusty_av1e = { workspace = true, features = ["asm", "threading"] }
+# (rusty_av1d >= 1.2.1 ships `src/arm/asm-offsets.h`; 1.2.0 left it out of the
+# package, which broke `asm` on every ARM target — issue #14.)
+rusty_av1d = { workspace = true, features = ["asm"] }

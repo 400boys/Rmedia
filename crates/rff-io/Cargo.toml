@@ -1,0 +1,32 @@
+[package]
+name = "rff-io"
+description = "Remade FFmpeg (Rust): I/O sources — local files, HTTP(S), UDP and RTP (RFC 6184 H.264, RFC 2435 JPEG) input."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["ffmpeg", "io", "http", "rtp", "streaming"]
+categories = ["multimedia"]
+
+[dependencies]
+rff-core.workspace = true
+# `https` feature only — a pure-Rust, permissively-licensed TLS stack.
+rustls = { workspace = true, optional = true }
+rustls-rustcrypto = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Real baseline JPEGs for the RFC 2435 receiver's oracle test.
+rusty_jpeg.workspace = true
+
+[features]
+# `https://` input via rustls + a RustCrypto crypto provider + the OS trust
+# store — pure Rust throughout, so it is ON by default: an ffmpeg that cannot
+# read an https URL fails the drop-in test. Opt out with
+# `--no-default-features` for a TLS-free build (plain `http://` stays).
+default = ["https"]
+https = ["dep:rustls", "dep:rustls-rustcrypto", "dep:rustls-native-certs"]

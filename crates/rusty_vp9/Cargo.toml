@@ -1,0 +1,22 @@
+[package]
+name = "rusty_vp9"
+version = "0.2.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+description = "Pure-Rust VP9 video decoder + encoder, no C/FFI. Decoder bit-exact against all 315 official libvpx conformance vectors."
+readme = "README.md"
+keywords = ["vp9", "video", "codec", "decoder", "encoder"]
+categories = ["multimedia::video", "multimedia::encoding"]
+rust-version = "1.85"
+
+[features]
+# Entropy-bin telemetry for the private Prometheus refinery (CASC campaign):
+# records every coefficient-token boolean bin (site, bit, prob) on the real
+# emit path. Off by default; the production build is byte-identical without
+# it, and byte-identical WITH it too — the tap only observes.
+prometheus-telemetry = []
+
+[dependencies]

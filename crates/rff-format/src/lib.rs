@@ -1,0 +1,536 @@
+//! `rff-format` — the container (muxer/demuxer) abstraction layer (FFmpeg's
+//! `libavformat` core, minus the formats themselves).
+//!
+//! A container is the file wrapper (AVI, MP4, Matroska, ...) that interleaves
+//! one or more elementary streams. This crate defines:
+//! * [`Stream`] — the description of one elementary stream inside a container,
+//! * [`Demuxer`] — reads a container, exposing streams and [`Packet`]s,
+//! * [`Muxer`] — writes streams + packets back into a container,
+//! * [`FormatRegistry`] — what individual format crates register into.
+//!
+//! Concrete formats live in their own crates (`rff-format-avi`, ...).
+
+pub mod aac;
+pub mod av1;
+pub mod avc;
+pub mod hvc;
+
+use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
+
+use rff_core::{
+    CleanAperture, CodecId, ColorInfo, ColorRange, ContentLightLevel, Dictionary, Error,
+    MasteringDisplay, MediaType, Packet, PixelFormat, Rational, Result, SampleFormat, Timecode,
+};
+
+/// Description of one elementary stream within a container.
+#[derive(Debug, Clone)]
+pub struct Stream {
+    /// Position of this stream within its container.
+    pub index: usize,
+    pub codec_id: CodecId,
+    pub media_type: MediaType,
+    /// Unit of all timestamps on packets of this stream.
+    pub time_base: Rational,
+    // --- Video parameters (zero/ignored for non-video) ---
+    pub width: u32,
+    pub height: u32,
+    /// Raw pixel layout, when known (raw video). Self-describing codecs leave this `None`.
+    pub pixel_format: Option<PixelFormat>,
+    /// Luma/chroma value range. JPEG and PNG sources are always
+    /// [`ColorRange::Full`]; leaving it [`Unspecified`](ColorRange::Unspecified)
+    /// makes containers label the data limited-range, which silently corrupts it.
+    pub color_range: ColorRange,
+    // --- Audio parameters (zero/ignored for non-audio) ---
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Raw sample layout, when known (PCM). Self-describing codecs leave this `None`.
+    pub sample_format: Option<SampleFormat>,
+    /// Codec-private initialization data (e.g. H.264 SPS/PPS, OpusHead). Empty
+    /// for codecs whose bitstream is fully self-describing.
+    pub extradata: Vec<u8>,
+    /// Total stream duration in [`time_base`](Stream::time_base) units, when
+    /// the container declares it (MP4 `mdhd`, Matroska `Duration`). `None` when
+    /// unknown (live streams, TS).
+    pub duration: Option<i64>,
+    /// Total packet count (frames for video), when the container's index
+    /// declares it. `None` when unknown — never a guess.
+    pub nb_frames: Option<u64>,
+    /// The container's own code for this codec, when it has one worth
+    /// keeping: the MP4/QuickTime sample-entry fourcc (`apch` vs `apcn` names
+    /// the ProRes profile, `twos` vs `sowt` the PCM byte order on disk). A
+    /// muxer of the same family writes it back when it is valid for the
+    /// codec, so a remux keeps the original entry; `None` lets the muxer pick.
+    pub codec_tag: Option<[u8; 4]>,
+    // --- Video description (containers label; they do not convert) ---
+    /// Colour primaries / transfer / matrix (MP4 `colr`, Matroska `Colour`).
+    pub color: ColorInfo,
+    /// HDR mastering display (MP4 `mdcv`, Matroska `MasteringMetadata`).
+    pub mastering_display: Option<MasteringDisplay>,
+    /// HDR content light level (MP4 `clli`, Matroska `MaxCLL`/`MaxFALL`).
+    pub content_light: Option<ContentLightLevel>,
+    /// Pixel aspect ratio as `(horizontal, vertical)` spacing (MP4 `pasp`).
+    /// `None` when not recorded, which means square.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// Clean aperture (MP4 `clap`).
+    pub clean_aperture: Option<CleanAperture>,
+    /// Start timecode (a QuickTime `tmcd` track referenced by this video track).
+    pub timecode: Option<Timecode>,
+    /// The frames carry an alpha plane as a block addition (Matroska
+    /// `AlphaMode`; WebM VP8/VP9 alpha).
+    pub alpha_mode: bool,
+    // --- Audio timing the container records beside the packets ---
+    /// Samples the decoder must drop from the start, in nanoseconds
+    /// (Matroska `CodecDelay`; Opus pre-skip). The demuxer has already taken
+    /// it off packet timestamps; it is here so a remux can write it back.
+    pub codec_delay_ns: u64,
+    /// How far before a seek target decoding must start to converge, in
+    /// nanoseconds (Matroska `SeekPreRoll`; 80 ms for Opus).
+    pub seek_preroll_ns: u64,
+}
+
+impl Stream {
+    /// Create a stream with sane defaults for the given codec.
+    pub fn new(index: usize, codec_id: CodecId) -> Stream {
+        Stream {
+            index,
+            codec_id,
+            media_type: codec_id.media_type(),
+            time_base: Rational::new(1, 1000),
+            width: 0,
+            height: 0,
+            pixel_format: None,
+            color_range: ColorRange::Unspecified,
+            sample_rate: 0,
+            channels: 0,
+            sample_format: None,
+            extradata: Vec::new(),
+            duration: None,
+            nb_frames: None,
+            codec_tag: None,
+            color: ColorInfo::UNSPECIFIED,
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            clean_aperture: None,
+            timecode: None,
+            alpha_mode: false,
+            codec_delay_ns: 0,
+            seek_preroll_ns: 0,
+        }
+    }
+}
+
+/// A byte source a demuxer reads from. (`Box<dyn Read + Send>` keeps the trait
+/// object-safe and lets inputs be files, network streams, or in-memory buffers.)
+pub type Input = Box<dyn Read + Send>;
+
+/// A byte source that can also seek — what a local file or an in-memory buffer
+/// offers and a pipe or socket does not. Blanket-implemented for every
+/// `Read + Seek` type.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// A seekable [`Input`]. Formats whose index can sit anywhere in the file (MP4's
+/// `moov`) use it to read only that index and fetch each payload on demand,
+/// instead of buffering the whole file. It upcasts to [`Input`] for formats
+/// that only stream.
+pub type SeekInput = Box<dyn ReadSeek + Send>;
+/// A byte sink a muxer writes to.
+pub type Output = Box<dyn Write + Send>;
+
+/// A byte sink that can also seek -- a local file, an in-memory buffer; not a
+/// pipe or socket. Blanket-implemented for every `Write + Seek` type.
+pub trait WriteSeek: Write + Seek {}
+impl<T: Write + Seek> WriteSeek for T {}
+
+/// A seekable [`Output`]. Containers whose header records sizes or an index
+/// that is only known at the end (MP4 `mdat`/`moov`, Matroska Segment/Cues,
+/// AVI `movi`/`idx1`, WAV `RIFF`/`data`) use it to stream the payload as it
+/// arrives and patch the header afterwards, instead of holding the whole
+/// output in memory until the trailer (#28). It upcasts to [`Output`] for
+/// muxers that only stream.
+pub type SeekOutput = Box<dyn WriteSeek + Send>;
+
+/// Reads a container format: parses the header into [`Stream`]s, then yields
+/// [`Packet`]s until the input is exhausted.
+pub trait Demuxer: Send {
+    /// Parse the container header and return its streams.
+    fn read_header(&mut self) -> Result<Vec<Stream>>;
+
+    /// Read the next packet. Returns [`Error::Eof`] at end of input.
+    fn read_packet(&mut self) -> Result<Packet>;
+}
+
+/// Writes a container format: declare streams, write packets, finalize.
+pub trait Muxer: Send {
+    /// Hand the muxer output metadata (`-metadata title=...`). Called before
+    /// [`write_header`](Muxer::write_header); formats without a metadata slot
+    /// simply ignore it (the default).
+    fn set_metadata(&mut self, _metadata: &Dictionary) {}
+
+    /// Write the container header for the given set of streams.
+    fn write_header(&mut self, streams: &[Stream]) -> Result<()>;
+
+    /// Write one packet (its `stream_index` selects the target stream).
+    fn write_packet(&mut self, packet: &Packet) -> Result<()>;
+
+    /// Finalize the container (indexes, trailers, fixups).
+    fn write_trailer(&mut self) -> Result<()>;
+}
+
+/// Factory opening a demuxer over an input byte source.
+pub type DemuxerFactory = fn(Input) -> Box<dyn Demuxer>;
+/// Factory opening a demuxer over a [`SeekInput`] — registered alongside the
+/// format's [`DemuxerFactory`] by formats that read less when they can seek.
+pub type SeekableDemuxerFactory = fn(SeekInput) -> Box<dyn Demuxer>;
+/// Factory opening a muxer over an output byte sink.
+pub type MuxerFactory = fn(Output) -> Box<dyn Muxer>;
+/// Factory opening a muxer over a [`SeekOutput`] -- registered alongside the
+/// format's [`MuxerFactory`] by formats that can stream when they can seek.
+pub type SeekableMuxerFactory = fn(SeekOutput) -> Box<dyn Muxer>;
+/// Factory opening a muxer that owns its own file set (HLS/DASH write a
+/// playlist/manifest plus many segment files, so a single byte sink cannot
+/// model them). Receives the output path and the format options
+/// (`-hls_time 6` → `{"hls_time": "6"}`).
+pub type PathMuxerFactory = fn(&std::path::Path, &Dictionary) -> Result<Box<dyn Muxer>>;
+/// Content sniffer: scores how strongly a byte prefix looks like this format,
+/// `0` (no match) to `100` (certain) — mirrors FFmpeg's `AVInputFormat::read_probe`.
+pub type ProbeFn = fn(&[u8]) -> i32;
+
+/// What a container's **muxer** will accept: the machine-readable half of the
+/// rules each muxer already enforces when it writes a header.
+///
+/// Muxers validate at run time, and a few historically wrote a zero codec tag
+/// rather than refusing an unmappable codec. Declaring the same rules here lets
+/// a caller answer "what can this file become?" *before* opening an encoder —
+/// which is what `rff-targets` is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuxCaps {
+    /// Every codec this muxer can write. Empty for demux-only formats.
+    pub codecs: &'static [CodecId],
+    /// Most streams the container holds; `None` when there is no fixed limit.
+    pub max_streams: Option<usize>,
+    /// True when the container holds exactly ONE picture, so extra frames are
+    /// refused or dropped (png, jpeg, gif, webp, avif, jxl, av2f).
+    pub still_image: bool,
+}
+
+impl MuxCaps {
+    /// A format that cannot be written at all (demux-only).
+    pub const NONE: MuxCaps = MuxCaps {
+        codecs: &[],
+        max_streams: Some(0),
+        still_image: false,
+    };
+
+    /// A container interleaving any number of streams (mp4, matroska, mpegts).
+    pub const fn container(codecs: &'static [CodecId]) -> MuxCaps {
+        MuxCaps {
+            codecs,
+            max_streams: None,
+            still_image: false,
+        }
+    }
+
+    /// A file holding exactly one elementary stream (wav, mp3, ivf, ogg).
+    pub const fn single(codecs: &'static [CodecId]) -> MuxCaps {
+        MuxCaps {
+            codecs,
+            max_streams: Some(1),
+            still_image: false,
+        }
+    }
+
+    /// Narrow a [`single`](MuxCaps::single) file to one picture (png, jpeg).
+    pub const fn image(self) -> MuxCaps {
+        MuxCaps {
+            codecs: self.codecs,
+            max_streams: self.max_streams,
+            still_image: true,
+        }
+    }
+
+    /// Can this muxer write `id`?
+    pub fn accepts(&self, id: CodecId) -> bool {
+        self.codecs.contains(&id)
+    }
+
+    /// Can this muxer carry any stream of `media` at all?
+    pub fn accepts_media(&self, media: MediaType) -> bool {
+        self.codecs.iter().any(|c| c.media_type() == media)
+    }
+
+    /// The codecs this muxer accepts for one media category.
+    pub fn codecs_for(&self, media: MediaType) -> impl Iterator<Item = CodecId> + '_ {
+        self.codecs
+            .iter()
+            .copied()
+            .filter(move |c| c.media_type() == media)
+    }
+}
+
+/// Static description of a container format and its read/write support.
+pub struct Format {
+    /// Short name (`avi`, `mp4`, ...), as used by `ffmpeg -f <name>`.
+    pub name: &'static str,
+    pub long_name: &'static str,
+    /// File extensions that imply this format (without the dot).
+    pub extensions: &'static [&'static str],
+    /// Present if this format can be demuxed (read).
+    pub demuxer: Option<DemuxerFactory>,
+    /// Present if this format can be muxed (written).
+    pub muxer: Option<MuxerFactory>,
+    /// Present for formats that mux into a *path* (playlist + segment files)
+    /// rather than one byte sink — HLS, DASH. Mutually exclusive with `muxer`.
+    pub muxer_path: Option<PathMuxerFactory>,
+    /// Content sniffer for magic-byte detection (independent of the filename).
+    pub probe: Option<ProbeFn>,
+    /// What this format's muxer accepts. [`MuxCaps::NONE`] for demux-only
+    /// formats. Keep it in step with the muxer — `tests/mux_caps.rs` gates it.
+    pub mux_caps: MuxCaps,
+}
+
+impl Format {
+    pub fn can_demux(&self) -> bool {
+        self.demuxer.is_some()
+    }
+    pub fn can_mux(&self) -> bool {
+        self.muxer.is_some() || self.muxer_path.is_some()
+    }
+}
+
+/// Holds every container format known to a running engine.
+#[derive(Default)]
+pub struct FormatRegistry {
+    by_name: HashMap<&'static str, Format>,
+    /// Seek-aware demuxer factories, keyed by format name (see
+    /// [`register_seekable_demuxer`](Self::register_seekable_demuxer)).
+    seekable: HashMap<&'static str, SeekableDemuxerFactory>,
+    /// Seek-aware muxer factories, keyed by format name (see
+    /// [`register_seekable_muxer`](Self::register_seekable_muxer)).
+    seekable_muxers: HashMap<&'static str, SeekableMuxerFactory>,
+}
+
+impl FormatRegistry {
+    pub fn new() -> FormatRegistry {
+        FormatRegistry::default()
+    }
+
+    pub fn register(&mut self, format: Format) {
+        self.by_name.insert(format.name, format);
+    }
+
+    /// Give the format named `name` a demuxer that takes a [`SeekInput`]. Used
+    /// by [`open_demuxer_seekable`](Self::open_demuxer_seekable) when the caller
+    /// has a seekable source; the plain [`Format::demuxer`] still serves pipes
+    /// and sockets.
+    pub fn register_seekable_demuxer(
+        &mut self,
+        name: &'static str,
+        factory: SeekableDemuxerFactory,
+    ) {
+        self.seekable.insert(name, factory);
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&Format> {
+        self.by_name.get(name)
+    }
+
+    /// Find a format whose extension list contains `ext` (case-insensitive,
+    /// no leading dot). The cheap "guess by filename" path; [`probe`](Self::probe)
+    /// inspects content instead.
+    pub fn by_extension(&self, ext: &str) -> Option<&Format> {
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        self.by_name
+            .values()
+            .find(|f| f.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext)))
+    }
+
+    /// Identify a format by sniffing a byte prefix: the registered format whose
+    /// [`probe`](Format::probe) returns the highest positive score wins. Returns
+    /// `None` if nothing recognizes the data.
+    pub fn probe(&self, data: &[u8]) -> Option<&Format> {
+        self.by_name
+            .values()
+            .filter_map(|f| f.probe.map(|p| (p(data), f)))
+            .filter(|(score, _)| *score > 0)
+            .max_by_key(|(score, _)| *score)
+            .map(|(_, f)| f)
+    }
+
+    /// Open a demuxer for the format named `name`.
+    pub fn open_demuxer(&self, name: &str, input: Input) -> Result<Box<dyn Demuxer>> {
+        self.by_name
+            .get(name)
+            .and_then(|f| f.demuxer)
+            .map(|factory| factory(input))
+            .ok_or_else(|| Error::DemuxerNotFound(name.to_string()))
+    }
+
+    /// Open a demuxer over a seekable input: the format's seek-aware demuxer if
+    /// it registered one, otherwise its plain streaming demuxer (a seekable
+    /// source is still a byte stream). Callers that hold a file should prefer
+    /// this — it is what lets MP4 read only `moov` instead of the whole file.
+    pub fn open_demuxer_seekable(&self, name: &str, input: SeekInput) -> Result<Box<dyn Demuxer>> {
+        if !self.by_name.get(name).is_some_and(Format::can_demux) {
+            return Err(Error::DemuxerNotFound(name.to_string()));
+        }
+        match self.seekable.get(name) {
+            Some(factory) => Ok(factory(input)),
+            None => self.open_demuxer(name, input),
+        }
+    }
+
+    /// Give the format named `name` a muxer that takes a [`SeekOutput`]. Used
+    /// by [`open_muxer_seekable`](Self::open_muxer_seekable) when the caller
+    /// writes to something seekable; the plain [`Format::muxer`] still serves
+    /// pipes and sockets.
+    pub fn register_seekable_muxer(&mut self, name: &'static str, factory: SeekableMuxerFactory) {
+        self.seekable_muxers.insert(name, factory);
+    }
+
+    /// Open a muxer over a seekable output: the format's seek-aware muxer if it
+    /// registered one, otherwise its plain muxer (a seekable sink is still a
+    /// byte sink). Callers writing a file should prefer this -- it is what lets
+    /// MP4/Matroska/AVI/WAV stream instead of buffering the whole output.
+    pub fn open_muxer_seekable(&self, name: &str, output: SeekOutput) -> Result<Box<dyn Muxer>> {
+        if !self.by_name.get(name).is_some_and(|f| f.muxer.is_some()) {
+            return Err(Error::MuxerNotFound(name.to_string()));
+        }
+        match self.seekable_muxers.get(name) {
+            Some(factory) => Ok(factory(output)),
+            None => self.open_muxer(name, output),
+        }
+    }
+
+    /// Open a muxer for the format named `name`.
+    pub fn open_muxer(&self, name: &str, output: Output) -> Result<Box<dyn Muxer>> {
+        self.by_name
+            .get(name)
+            .and_then(|f| f.muxer)
+            .map(|factory| factory(output))
+            .ok_or_else(|| Error::MuxerNotFound(name.to_string()))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Format> {
+        self.by_name.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Reports which factory built it via the stream count.
+    struct Tagged(usize);
+    impl Demuxer for Tagged {
+        fn read_header(&mut self) -> Result<Vec<Stream>> {
+            Ok((0..self.0).map(|i| Stream::new(i, CodecId::None)).collect())
+        }
+        fn read_packet(&mut self) -> Result<rff_core::Packet> {
+            Err(Error::Eof)
+        }
+    }
+
+    fn format(name: &'static str) -> Format {
+        Format {
+            name,
+            long_name: name,
+            extensions: &[],
+            demuxer: Some(|_| Box::new(Tagged(1))),
+            muxer: None,
+            muxer_path: None,
+            probe: None,
+            mux_caps: MuxCaps::NONE,
+        }
+    }
+
+    fn streams(mut d: Box<dyn Demuxer>) -> usize {
+        d.read_header().unwrap().len()
+    }
+
+    #[test]
+    fn seekable_open_prefers_the_seekable_factory_and_falls_back() {
+        let mut r = FormatRegistry::new();
+        r.register(format("plain"));
+        r.register(format("seeky"));
+        r.register_seekable_demuxer("seeky", |_| Box::new(Tagged(2)));
+        let input = || -> SeekInput { Box::new(Cursor::new(vec![0u8; 4])) };
+        assert_eq!(
+            streams(r.open_demuxer_seekable("seeky", input()).unwrap()),
+            2
+        );
+        // No seekable factory: the streaming one serves the seekable input.
+        assert_eq!(
+            streams(r.open_demuxer_seekable("plain", input()).unwrap()),
+            1
+        );
+        // A plain stream open never takes the seekable path.
+        assert_eq!(
+            streams(
+                r.open_demuxer("seeky", Box::new(Cursor::new(vec![])))
+                    .unwrap()
+            ),
+            1
+        );
+        assert!(matches!(
+            r.open_demuxer_seekable("missing", input()),
+            Err(Error::DemuxerNotFound(_))
+        ));
+    }
+
+    /// Reports which factory built it through the error `write_trailer` returns.
+    struct TaggedMux(&'static str);
+    impl Muxer for TaggedMux {
+        fn write_header(&mut self, _: &[Stream]) -> Result<()> {
+            Ok(())
+        }
+        fn write_packet(&mut self, _: &rff_core::Packet) -> Result<()> {
+            Ok(())
+        }
+        fn write_trailer(&mut self) -> Result<()> {
+            Err(Error::invalid(self.0))
+        }
+    }
+
+    fn tag(mut m: Box<dyn Muxer>) -> String {
+        m.write_trailer().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn seekable_muxer_open_prefers_the_seekable_factory_and_falls_back() {
+        let mut r = FormatRegistry::new();
+        let with_muxer = |name| Format {
+            muxer: Some(|_| Box::new(TaggedMux("plain"))),
+            ..format(name)
+        };
+        r.register(with_muxer("plain"));
+        r.register(with_muxer("seeky"));
+        r.register(format("demux_only"));
+        r.register_seekable_muxer("seeky", |_| Box::new(TaggedMux("seekable")));
+        let output = || -> SeekOutput { Box::new(Cursor::new(Vec::new())) };
+        assert!(tag(r.open_muxer_seekable("seeky", output()).unwrap()).contains("seekable"));
+        // No seekable factory: the plain one serves the seekable output.
+        assert!(tag(r.open_muxer_seekable("plain", output()).unwrap()).contains("plain"));
+        // A plain open never takes the seekable path.
+        assert!(tag(r.open_muxer("seeky", Box::new(Vec::new())).unwrap()).contains("plain"));
+        assert!(matches!(
+            r.open_muxer_seekable("demux_only", output()),
+            Err(Error::MuxerNotFound(_))
+        ));
+        assert!(matches!(
+            r.open_muxer_seekable("missing", output()),
+            Err(Error::MuxerNotFound(_))
+        ));
+    }
+}

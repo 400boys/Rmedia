@@ -1,0 +1,378 @@
+//! Core media enumerations: media types, codec identifiers, and raw sample
+//! layouts (pixel formats for video, sample formats for audio).
+//!
+//! These deliberately cover only a small, growing subset of what FFmpeg
+//! supports. Add variants as new codecs land — every variant is `#[non_exhaustive]`
+//! friendly so downstream `match`es must keep a wildcard arm.
+
+use std::fmt;
+
+/// The broad category of an elementary stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaType {
+    Video,
+    Audio,
+    Subtitle,
+    Data,
+    Attachment,
+}
+
+impl fmt::Display for MediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            MediaType::Video => "video",
+            MediaType::Audio => "audio",
+            MediaType::Subtitle => "subtitle",
+            MediaType::Data => "data",
+            MediaType::Attachment => "attachment",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Identifier for a specific codec (the *what*, independent of any particular
+/// encoder/decoder *implementation*).
+///
+/// Marked `#[non_exhaustive]`: we add codecs over time, and external matchers
+/// must handle the open-ended set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum CodecId {
+    /// Sentinel for "no/unknown codec".
+    #[default]
+    None,
+    /// H.264 / AVC video.
+    H264,
+    /// H.265 / HEVC video. Decode only.
+    Hevc,
+    /// Opus audio.
+    Opus,
+    /// AVIF still image (an AV1 intra frame in a HEIF box).
+    Avif,
+    /// PNG still image (DEFLATE-compressed RGB/RGBA).
+    Png,
+    /// JPEG still image (a.k.a. MJPEG).
+    Jpeg,
+    /// GIF image (first frame; palette-based).
+    Gif,
+    /// WebP image (VP8 / VP8L).
+    Webp,
+    /// Linear PCM audio (uncompressed; layout in the stream's sample format).
+    Pcm,
+    /// Vorbis audio (Ogg Vorbis).
+    Vorbis,
+    /// FLAC lossless audio.
+    Flac,
+    /// JPEG XL image.
+    Jxl,
+    /// AAC audio (Advanced Audio Coding).
+    Aac,
+    /// VP9 video.
+    Vp9,
+    /// AV2 video (AOMedia's successor to AV1). Decode only.
+    Av2,
+    /// MP3 audio (MPEG-1/2 Audio Layer III).
+    Mp3,
+    /// Raw uncompressed video (planar/packed pixels; layout in the stream's
+    /// pixel format). The video analog of [`CodecId::Pcm`].
+    RawVideo,
+    /// SubRip subtitle (`.srt`): plain-text cues with `HH:MM:SS,mmm` timing.
+    Subrip,
+    /// WebVTT subtitle (`.vtt`): plain-text cues with `HH:MM:SS.mmm` timing.
+    WebVtt,
+    /// Apple ProRes video (422 Proxy/LT/standard/HQ, 4444, 4444 XQ). Stream
+    /// copy only; the profile travels as the stream's `codec_tag`.
+    ProRes,
+    /// Avid DNxHD / DNxHR video. Stream copy only.
+    DnxHd,
+    /// APV (Advanced Professional Video). Stream copy only.
+    Apv,
+    /// VP8 video. Stream copy only.
+    Vp8,
+    /// Apple Lossless (ALAC) audio. Stream copy only.
+    Alac,
+    /// Dolby Digital (AC-3) audio. Stream copy only.
+    Ac3,
+    /// Dolby Digital Plus (E-AC-3) audio. Stream copy only.
+    Eac3,
+}
+
+impl CodecId {
+    /// Short canonical name, matching the token used on the `ffmpeg` command
+    /// line (`-c:v h264`, `-c:a opus`, ...).
+    pub fn name(self) -> &'static str {
+        match self {
+            CodecId::None => "none",
+            CodecId::H264 => "h264",
+            CodecId::Hevc => "hevc",
+            CodecId::Opus => "opus",
+            CodecId::Avif => "avif",
+            CodecId::Png => "png",
+            CodecId::Jpeg => "mjpeg",
+            CodecId::Gif => "gif",
+            CodecId::Webp => "webp",
+            CodecId::Pcm => "pcm",
+            CodecId::Vorbis => "vorbis",
+            CodecId::Flac => "flac",
+            CodecId::Jxl => "jpegxl",
+            CodecId::Aac => "aac",
+            CodecId::Vp9 => "vp9",
+            CodecId::Av2 => "av2",
+            CodecId::Mp3 => "mp3",
+            CodecId::RawVideo => "rawvideo",
+            CodecId::Subrip => "subrip",
+            CodecId::WebVtt => "webvtt",
+            CodecId::ProRes => "prores",
+            CodecId::DnxHd => "dnxhd",
+            CodecId::Apv => "apv",
+            CodecId::Vp8 => "vp8",
+            CodecId::Alac => "alac",
+            CodecId::Ac3 => "ac3",
+            CodecId::Eac3 => "eac3",
+        }
+    }
+
+    /// The media category this codec produces.
+    pub fn media_type(self) -> MediaType {
+        match self {
+            CodecId::None => MediaType::Data,
+            CodecId::H264 | CodecId::Hevc => MediaType::Video,
+            CodecId::Opus => MediaType::Audio,
+            // Image codecs carry pixel data; we model them as (single-frame) video.
+            CodecId::Avif => MediaType::Video,
+            CodecId::Png => MediaType::Video,
+            CodecId::Jpeg => MediaType::Video,
+            CodecId::Gif => MediaType::Video,
+            CodecId::Webp => MediaType::Video,
+            CodecId::Pcm => MediaType::Audio,
+            CodecId::Vorbis => MediaType::Audio,
+            CodecId::Flac => MediaType::Audio,
+            CodecId::Jxl => MediaType::Video,
+            CodecId::Aac => MediaType::Audio,
+            CodecId::Vp9 => MediaType::Video,
+            CodecId::Av2 => MediaType::Video,
+            CodecId::Mp3 => MediaType::Audio,
+            CodecId::RawVideo => MediaType::Video,
+            CodecId::Subrip => MediaType::Subtitle,
+            CodecId::WebVtt => MediaType::Subtitle,
+            CodecId::ProRes | CodecId::DnxHd | CodecId::Apv | CodecId::Vp8 => MediaType::Video,
+            CodecId::Alac | CodecId::Ac3 | CodecId::Eac3 => MediaType::Audio,
+        }
+    }
+
+    /// The sample format a codec NAME pins, when the name carries one.
+    ///
+    /// `CodecId` is deliberately format-agnostic — `pcm_s16le` and `pcm_f32le`
+    /// are both [`CodecId::Pcm`] — but for raw PCM the name IS the format, and
+    /// dropping it means `-c:a pcm_s16le` silently writes whatever the decoder
+    /// happened to emit. Compressed codecs return `None`: their sample format is
+    /// an internal detail, not something the CLI name selects.
+    pub fn sample_format_from_name(name: &str) -> Option<SampleFormat> {
+        match name {
+            "pcm_u8" => Some(SampleFormat::U8),
+            "pcm_s16le" => Some(SampleFormat::S16),
+            "pcm_s24le" => Some(SampleFormat::S24),
+            "pcm_s32le" => Some(SampleFormat::S32),
+            "pcm_f32le" => Some(SampleFormat::F32),
+            "pcm_f64le" => Some(SampleFormat::F64),
+            _ => None,
+        }
+    }
+
+    /// Look up a codec id from its canonical CLI name.
+    pub fn from_name(name: &str) -> Option<CodecId> {
+        match name {
+            "h264" | "avc" | "libx264" => Some(CodecId::H264),
+            "hevc" | "h265" | "x265" | "libx265" => Some(CodecId::Hevc),
+            "opus" | "libopus" => Some(CodecId::Opus),
+            "avif" => Some(CodecId::Avif),
+            "png" => Some(CodecId::Png),
+            "mjpeg" | "jpeg" | "jpg" => Some(CodecId::Jpeg),
+            "gif" => Some(CodecId::Gif),
+            "webp" => Some(CodecId::Webp),
+            "pcm" | "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"
+            | "pcm_f64le" => Some(CodecId::Pcm),
+            "vorbis" => Some(CodecId::Vorbis),
+            "flac" => Some(CodecId::Flac),
+            "jpegxl" | "jxl" => Some(CodecId::Jxl),
+            "aac" => Some(CodecId::Aac),
+            "vp9" | "libvpx-vp9" => Some(CodecId::Vp9),
+            "av2" | "libavm" => Some(CodecId::Av2),
+            "mp3" | "mp3float" | "libmp3lame" => Some(CodecId::Mp3),
+            "rawvideo" | "yuv4mpegpipe" => Some(CodecId::RawVideo),
+            "srt" | "subrip" => Some(CodecId::Subrip),
+            "vtt" | "webvtt" => Some(CodecId::WebVtt),
+            "prores" | "prores_ks" => Some(CodecId::ProRes),
+            "dnxhd" | "dnxhr" => Some(CodecId::DnxHd),
+            "apv" => Some(CodecId::Apv),
+            "vp8" | "libvpx" => Some(CodecId::Vp8),
+            "alac" => Some(CodecId::Alac),
+            "ac3" => Some(CodecId::Ac3),
+            "eac3" => Some(CodecId::Eac3),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CodecId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Luma/chroma value range of a Y'CbCr stream.
+///
+/// This is metadata, not a conversion: it records how the samples in a plane
+/// should be interpreted, so containers can label them and consumers can avoid
+/// re-scaling data that is already in the range they want.
+///
+/// Getting it wrong is expensive and silent. Writing full-range samples into a
+/// y4m without an `XCOLORRANGE=FULL` tag makes every reader treat them as
+/// limited-range; on real content that fabricated **12 dB** of error between two
+/// byte-identical payloads (41.3 dB compared raw, 29.0 dB compared through the
+/// mislabelled container).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ColorRange {
+    /// Not known. Consumers apply their own default — for Y'CbCr that is
+    /// conventionally limited range, which is why leaving this unset on
+    /// full-range data is a bug rather than a neutral choice.
+    #[default]
+    Unspecified,
+    /// "TV" / MPEG range: Y 16–235, Cb/Cr 16–240.
+    Limited,
+    /// "PC" / JPEG range: all components 0–255. JPEG and PNG are always this.
+    Full,
+}
+
+impl ColorRange {
+    /// The y4m `XCOLORRANGE` tag value, or `None` when unspecified.
+    pub fn y4m_tag(self) -> Option<&'static str> {
+        match self {
+            ColorRange::Unspecified => None,
+            ColorRange::Limited => Some("LIMITED"),
+            ColorRange::Full => Some("FULL"),
+        }
+    }
+
+    /// Parse a y4m `XCOLORRANGE` value.
+    pub fn from_y4m_tag(tag: &str) -> ColorRange {
+        match tag.trim().to_ascii_uppercase().as_str() {
+            "FULL" => ColorRange::Full,
+            "LIMITED" => ColorRange::Limited,
+            _ => ColorRange::Unspecified,
+        }
+    }
+}
+
+/// Raw pixel layout of a decoded video frame. A small starter subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PixelFormat {
+    /// Planar Y'CbCr 4:2:0, 8-bit (the workhorse for H.264).
+    Yuv420p,
+    /// Planar Y'CbCr 4:2:2, 8-bit.
+    Yuv422p,
+    /// Planar Y'CbCr 4:4:4, 8-bit.
+    Yuv444p,
+    /// Planar Y'CbCr 4:2:0, 10-bit (each sample stored as little-endian u16).
+    Yuv420p10,
+    /// Planar Y'CbCr 4:2:2, 10-bit (little-endian u16 samples).
+    Yuv422p10,
+    /// Planar Y'CbCr 4:4:4, 10-bit (little-endian u16 samples).
+    Yuv444p10,
+    /// Planar Y'CbCr 4:2:0, 12-bit (little-endian u16 samples).
+    Yuv420p12,
+    /// Planar Y'CbCr 4:2:2, 12-bit (little-endian u16 samples).
+    Yuv422p12,
+    /// Planar Y'CbCr 4:4:4, 12-bit (little-endian u16 samples).
+    Yuv444p12,
+    /// Packed RGB, 8 bits per channel.
+    Rgb24,
+    /// Packed RGBA, 8 bits per channel.
+    Rgba,
+}
+
+impl PixelFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            PixelFormat::Yuv420p => "yuv420p",
+            PixelFormat::Yuv422p => "yuv422p",
+            PixelFormat::Yuv444p => "yuv444p",
+            PixelFormat::Yuv420p10 => "yuv420p10le",
+            PixelFormat::Yuv422p10 => "yuv422p10le",
+            PixelFormat::Yuv444p10 => "yuv444p10le",
+            PixelFormat::Yuv420p12 => "yuv420p12le",
+            PixelFormat::Yuv422p12 => "yuv422p12le",
+            PixelFormat::Yuv444p12 => "yuv444p12le",
+            PixelFormat::Rgb24 => "rgb24",
+            PixelFormat::Rgba => "rgba",
+        }
+    }
+
+    /// Bits per component sample (8 for the 8-bit formats, 10 for the 10-bit
+    /// planar ones).
+    pub fn bit_depth(self) -> u32 {
+        match self {
+            PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 | PixelFormat::Yuv444p10 => 10,
+            PixelFormat::Yuv420p12 | PixelFormat::Yuv422p12 | PixelFormat::Yuv444p12 => 12,
+            _ => 8,
+        }
+    }
+
+    /// Bytes used to store one component sample: 1 for 8-bit, 2 for the 10-bit
+    /// formats (whose samples live in the low bits of a little-endian `u16`).
+    pub fn bytes_per_sample(self) -> usize {
+        if self.bit_depth() > 8 {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// Raw audio sample layout. Multi-byte samples are little-endian; containers
+/// that store big-endian PCM (QuickTime `twos`, `in24`, ...) swap on the way
+/// in and out, so a buffer of a given format always means one byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SampleFormat {
+    /// Signed 16-bit, interleaved.
+    S16,
+    /// 32-bit float, interleaved.
+    F32,
+    /// 32-bit float, planar (one buffer per channel).
+    F32Planar,
+    /// Unsigned 8-bit (128 = silence), interleaved.
+    U8,
+    /// Signed 24-bit packed in 3 bytes, interleaved.
+    S24,
+    /// Signed 32-bit, interleaved.
+    S32,
+    /// 64-bit float, interleaved.
+    F64,
+}
+
+impl SampleFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            SampleFormat::S16 => "s16",
+            SampleFormat::F32 => "flt",
+            SampleFormat::F32Planar => "fltp",
+            SampleFormat::U8 => "u8",
+            SampleFormat::S24 => "s24",
+            SampleFormat::S32 => "s32",
+            SampleFormat::F64 => "dbl",
+        }
+    }
+
+    /// Bytes occupied by one sample of one channel.
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            SampleFormat::U8 => 1,
+            SampleFormat::S16 => 2,
+            SampleFormat::S24 => 3,
+            SampleFormat::S32 | SampleFormat::F32 | SampleFormat::F32Planar => 4,
+            SampleFormat::F64 => 8,
+        }
+    }
+}

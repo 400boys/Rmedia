@@ -1,0 +1,17 @@
+[package]
+name = "rff-format-avif"
+description = "Remade FFmpeg (Rust): AVIF (AV1 Image File Format) container demuxer/muxer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["avif", "heif", "container", "image", "muxer"]
+categories = ["multimedia", "multimedia::images", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true

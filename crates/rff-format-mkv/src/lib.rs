@@ -1,0 +1,2647 @@
+//! Matroska / WebM demuxer and muxer.
+//!
+//! Matroska is an [EBML](https://www.matroska.org/) (binary XML) container.
+//! WebM is its restricted profile (VP8/VP9/AV1 video + Opus/Vorbis audio). The
+//! demuxer streams the EBML element tree from the (unseekable) [`Input`]:
+//! `read_header` reads the Info and Tracks bodies, streams past everything
+//! else (SeekHead, Tags, Void…) and stops at the first Cluster, so opening a
+//! file costs memory proportional to its headers. `read_packet` then walks the
+//! Clusters incrementally — known- or unknown-size — turning each
+//! (Simple)Block into a [`Packet`]; peak memory is one block, not the file.
+//! The muxers (in [`mux`]) write the inverse: SeekHead + Info + Tracks +
+//! Clusters + Cues -- streamed on a seekable output, buffered otherwise.
+//!
+//! Beyond the frames themselves, both directions carry what an editor needs
+//! to keep a remux faithful:
+//!
+//! * Video `Colour` (matrix, range, transfer, primaries, MaxCLL/MaxFALL,
+//!   MasteringMetadata) ↔ [`Stream::color`], [`Stream::color_range`],
+//!   [`Stream::content_light`], [`Stream::mastering_display`].
+//! * `AlphaMode` ↔ [`Stream::alpha_mode`], and `BlockAdditions` ↔
+//!   [`Packet::additions`] (WebM VP8/VP9 alpha is BlockAddID 1). A laced block's
+//!   additions go on every frame of the block, as matroskadec does.
+//! * `CodecDelay` / `SeekPreRoll` ↔ [`Stream::codec_delay_ns`] /
+//!   [`Stream::seek_preroll_ns`]. The demuxer takes the codec delay off every
+//!   timestamp and the muxer puts it back on, so a remux keeps them stable.
+//! * A BlockGroup is a keyframe exactly when it has no `ReferenceBlock`, as in
+//!   matroskadec; the muxer writes one for non-keyframes it puts in groups.
+//! * `ContentEncodings` (demux only): header stripping and zlib are undone on
+//!   every frame (scope 1) and on CodecPrivate (scope 2) before any other
+//!   processing. Encrypted tracks, and bzlib/LZO compression, make
+//!   `read_header` fail with [`Error::Unsupported`] naming the track: the file
+//!   is refused rather than any track's ciphertext handed out as frames.
+
+mod encoding;
+#[cfg(test)]
+mod metadata_tests;
+mod mux;
+
+use std::collections::VecDeque;
+use std::io::{self, BufReader, Read};
+
+use rff_core::{
+    BlockAdditional, CodecId, ColorInfo, ColorRange, ContentLightLevel, Error, MasteringDisplay,
+    MediaType, Packet, Rational, Result, SampleFormat,
+};
+use rff_format::avc::{avcc_to_annexb, parse_avcc, AvcConfig};
+use rff_format::{Demuxer, Format, FormatRegistry, Input, MuxCaps, Stream};
+
+pub use mux::{MkvMuxer, MkvStreamingMuxer};
+
+/// Register the Matroska and WebM formats (demux + mux). WebM is a separate
+/// registry entry so `out.webm` gets the restricted doctype and codec checks;
+/// both share one demuxer.
+pub fn register(registry: &mut FormatRegistry) {
+    registry.register(Format {
+        name: "matroska",
+        long_name: "Matroska (EBML)",
+        extensions: &["mkv", "mka", "mks"],
+        demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
+        muxer: Some(|out| Box::new(MkvMuxer::new(out, false))),
+        muxer_path: None,
+        probe: Some(probe_mkv),
+        mux_caps: MuxCaps::container(&[
+            CodecId::Vp9,
+            CodecId::Vp8,
+            CodecId::Avif,
+            CodecId::H264,
+            CodecId::Opus,
+            CodecId::Vorbis,
+            CodecId::Aac,
+            CodecId::Flac,
+            CodecId::Mp3,
+            CodecId::Pcm,
+            CodecId::Ac3,
+            CodecId::Eac3,
+            CodecId::Alac,
+            CodecId::Subrip,
+            CodecId::WebVtt,
+        ]),
+    });
+    registry.register(Format {
+        name: "webm",
+        long_name: "WebM (restricted Matroska)",
+        extensions: &["webm"],
+        demuxer: Some(|input| Box::new(MkvDemuxer::new(input))),
+        muxer: Some(|out| Box::new(MkvMuxer::new(out, true))),
+        muxer_path: None,
+        probe: None, // content-probing is matroska's job; webm is chosen by name
+        mux_caps: MuxCaps::container(&[
+            CodecId::Vp9,
+            CodecId::Vp8,
+            CodecId::Avif,
+            CodecId::Opus,
+            CodecId::Vorbis,
+            CodecId::WebVtt,
+        ]),
+    });
+    // Seekable outputs (local files) stream; the plain factories above keep
+    // serving pipes and sockets with the in-memory layout.
+    registry.register_seekable_muxer("matroska", |out| {
+        Box::new(MkvStreamingMuxer::new(out, false))
+    });
+    registry.register_seekable_muxer("webm", |out| Box::new(MkvStreamingMuxer::new(out, true)));
+}
+
+/// The EBML magic (`\x1A\x45\xDF\xA3`) starts every Matroska/WebM file.
+pub fn probe_mkv(bytes: &[u8]) -> i32 {
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        90
+    } else {
+        0
+    }
+}
+
+// ---- EBML element IDs (with their length-marker bits intact) --------------
+const ID_EBML_HEADER: u32 = 0x1A45_DFA3;
+const ID_SEGMENT: u32 = 0x1853_8067;
+const ID_SEEK_HEAD: u32 = 0x114D_9B74;
+const ID_INFO: u32 = 0x1549_A966;
+const ID_TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const ID_DURATION: u32 = 0x4489;
+const ID_TRACKS: u32 = 0x1654_AE6B;
+const ID_TRACK_ENTRY: u32 = 0xAE;
+const ID_TRACK_NUMBER: u32 = 0xD7;
+const ID_TRACK_TYPE: u32 = 0x83;
+const ID_CODEC_ID: u32 = 0x86;
+const ID_CODEC_PRIVATE: u32 = 0x63A2;
+const ID_DEFAULT_DURATION: u32 = 0x23E383;
+const ID_VIDEO: u32 = 0xE0;
+const ID_PIXEL_WIDTH: u32 = 0xB0;
+const ID_PIXEL_HEIGHT: u32 = 0xBA;
+const ID_FRAME_RATE: u32 = 0x2383E3;
+const ID_AUDIO: u32 = 0xE1;
+const ID_SAMPLING_FREQUENCY: u32 = 0xB5;
+const ID_CHANNELS: u32 = 0x9F;
+const ID_BIT_DEPTH: u32 = 0x6264;
+const ID_CODEC_DELAY: u32 = 0x56AA;
+const ID_SEEK_PREROLL: u32 = 0x56BB;
+const ID_MAX_BLOCK_ADDITION_ID: u32 = 0x55EE;
+const ID_CONTENT_ENCODINGS: u32 = 0x6D80;
+const ID_ALPHA_MODE: u32 = 0x53C0;
+const ID_COLOUR: u32 = 0x55B0;
+const ID_MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const ID_RANGE: u32 = 0x55B9;
+const ID_TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const ID_PRIMARIES: u32 = 0x55BB;
+const ID_MAX_CLL: u32 = 0x55BC;
+const ID_MAX_FALL: u32 = 0x55BD;
+const ID_MASTERING_METADATA: u32 = 0x55D0;
+const ID_PRIMARY_R_X: u32 = 0x55D1;
+const ID_PRIMARY_R_Y: u32 = 0x55D2;
+const ID_PRIMARY_G_X: u32 = 0x55D3;
+const ID_PRIMARY_G_Y: u32 = 0x55D4;
+const ID_PRIMARY_B_X: u32 = 0x55D5;
+const ID_PRIMARY_B_Y: u32 = 0x55D6;
+const ID_WHITE_POINT_X: u32 = 0x55D7;
+const ID_WHITE_POINT_Y: u32 = 0x55D8;
+const ID_LUMINANCE_MAX: u32 = 0x55D9;
+const ID_LUMINANCE_MIN: u32 = 0x55DA;
+const ID_CLUSTER: u32 = 0x1F43_B675;
+const ID_TIMESTAMP: u32 = 0xE7;
+const ID_SIMPLE_BLOCK: u32 = 0xA3;
+const ID_BLOCK_GROUP: u32 = 0xA0;
+const ID_BLOCK: u32 = 0xA1;
+const ID_BLOCK_DURATION: u32 = 0x9B;
+const ID_DISCARD_PADDING: u32 = 0x75A2;
+const ID_REFERENCE_BLOCK: u32 = 0xFB;
+const ID_BLOCK_ADDITIONS: u32 = 0x75A1;
+const ID_BLOCK_MORE: u32 = 0xA6;
+const ID_BLOCK_ADD_ID: u32 = 0xEE;
+const ID_BLOCK_ADDITIONAL: u32 = 0xA5;
+const ID_CUES: u32 = 0x1C53_BB6B;
+const ID_ATTACHMENTS: u32 = 0x1941_A469;
+const ID_CHAPTERS: u32 = 0x1043_A770;
+const ID_TAGS: u32 = 0x1254_C367;
+
+/// Segment children ("level 1") and the level-0 IDs. Meeting one of these
+/// while inside a Cluster means that Cluster is over — the only way an
+/// unknown-size (live-written) Cluster ends.
+fn is_level1(id: u32) -> bool {
+    matches!(
+        id,
+        ID_EBML_HEADER
+            | ID_SEGMENT
+            | ID_SEEK_HEAD
+            | ID_INFO
+            | ID_TRACKS
+            | ID_CLUSTER
+            | ID_CUES
+            | ID_ATTACHMENTS
+            | ID_CHAPTERS
+            | ID_TAGS
+    )
+}
+
+/// Read-ahead buffer over the (unseekable) input.
+const READ_BUF: usize = 64 * 1024;
+/// Info / Tracks bodies are read whole; a declared size past this is corrupt
+/// (real ones are a few KiB) and the element is skipped instead.
+const MAX_HEADER_ELEMENT: u64 = 64 << 20;
+/// A (Simple)Block or BlockGroup declaring more than this is skipped rather
+/// than buffered — far above any real frame, it bounds garbage input.
+const MAX_BLOCK: u64 = 1 << 30;
+
+/// A cursor over an in-memory element body that reads EBML primitives.
+struct Ebml<'a> {
+    d: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Ebml<'a> {
+    fn new(d: &'a [u8]) -> Ebml<'a> {
+        Ebml { d, pos: 0 }
+    }
+
+    fn at(d: &'a [u8], pos: usize) -> Ebml<'a> {
+        Ebml { d, pos }
+    }
+
+    /// Read an element ID (1-4 bytes), keeping the length-marker bits.
+    fn read_id(&mut self) -> Option<u32> {
+        let first = *self.d.get(self.pos)?;
+        let len = first.leading_zeros() as usize + 1;
+        if len > 4 || self.pos + len > self.d.len() {
+            return None;
+        }
+        let mut id = 0u32;
+        for i in 0..len {
+            id = (id << 8) | self.d[self.pos + i] as u32;
+        }
+        self.pos += len;
+        Some(id)
+    }
+
+    /// Read an EBML size (vint with the marker stripped). `None` element value
+    /// means an "unknown size" marker (all value bits set).
+    fn read_size(&mut self) -> Option<(u64, bool)> {
+        let first = *self.d.get(self.pos)?;
+        let len = first.leading_zeros() as usize + 1;
+        if len > 8 || self.pos + len > self.d.len() {
+            return None;
+        }
+        let mask = (1u64 << (8 - len)) - 1;
+        let mut val = (first as u64) & mask;
+        let mut all_ones = (first as u64) & mask == mask;
+        for i in 1..len {
+            let b = self.d[self.pos + i];
+            val = (val << 8) | b as u64;
+            all_ones = all_ones && b == 0xFF;
+        }
+        self.pos += len;
+        Some((val, all_ones && len > 0))
+    }
+
+    /// Big-endian unsigned of `len` bytes (missing bytes read as zero). Only
+    /// the last 8 bytes can survive the shifts, so only those are visited —
+    /// a corrupt multi-gigabyte `len` costs nothing.
+    fn read_uint(&mut self, len: usize) -> u64 {
+        let mut v = 0u64;
+        for i in len.saturating_sub(8)..len {
+            let b = self.pos.checked_add(i).and_then(|p| self.d.get(p));
+            v = (v << 8) | *b.unwrap_or(&0) as u64;
+        }
+        self.pos = self.pos.saturating_add(len);
+        v
+    }
+
+    /// Big-endian two's-complement signed integer of `len` (at most 8
+    /// meaningful) bytes, as EBML stores signed elements.
+    fn read_int(&mut self, len: usize) -> i64 {
+        let v = self.read_uint(len);
+        match len.min(8) {
+            0 => 0,
+            n => {
+                let shift = 64 - 8 * n as u32;
+                ((v << shift) as i64) >> shift
+            }
+        }
+    }
+
+    fn read_float(&mut self, len: usize) -> f64 {
+        let bytes = |n: usize| {
+            self.pos
+                .checked_add(n)
+                .and_then(|end| self.d.get(self.pos..end))
+        };
+        let v = match len {
+            4 => bytes(4)
+                .map(|b| f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                .unwrap_or(0.0),
+            8 => bytes(8)
+                .map(|b| f64::from_be_bytes(b.try_into().unwrap()))
+                .unwrap_or(0.0),
+            _ => 0.0,
+        };
+        self.pos = self.pos.saturating_add(len);
+        v
+    }
+
+    fn read_bytes(&mut self, len: usize) -> &'a [u8] {
+        let start = self.pos.min(self.d.len());
+        let end = self.pos.saturating_add(len).min(self.d.len());
+        let s = &self.d[start..end];
+        self.pos = end;
+        s
+    }
+
+    fn skip(&mut self, len: usize) {
+        self.pos = self.pos.saturating_add(len);
+    }
+}
+
+/// The children `(id, body)` of an in-memory element body. A child declaring
+/// more than is left gets what is left; the walk ends at the first header
+/// that doesn't parse.
+fn children(data: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
+    let mut e = Ebml::new(data);
+    std::iter::from_fn(move || {
+        if e.pos >= data.len() {
+            return None;
+        }
+        let id = e.read_id()?;
+        let (size, _) = e.read_size()?;
+        Some((
+            id,
+            e.read_bytes(usize::try_from(size).unwrap_or(usize::MAX)),
+        ))
+    })
+}
+
+/// An unsigned element's value from its whole body.
+fn uint_of(body: &[u8]) -> u64 {
+    Ebml::new(body).read_uint(body.len())
+}
+
+/// A float element's value from its whole body (0 for a size other than 4/8).
+fn float_of(body: &[u8]) -> f64 {
+    Ebml::new(body).read_float(body.len())
+}
+
+/// Apply a Video `Colour` body to `s`. Absent fields keep their unspecified
+/// defaults; out-of-range code points read as unspecified.
+fn parse_colour(s: &mut Stream, body: &[u8]) {
+    let code = |b: &[u8]| u16::try_from(uint_of(b)).unwrap_or(ColorInfo::UNSPECIFIED_CODE);
+    let level = |b: &[u8]| uint_of(b).min(u16::MAX as u64) as u16;
+    let mut light: Option<ContentLightLevel> = None;
+    for (id, b) in children(body) {
+        match id {
+            ID_MATRIX_COEFFICIENTS => s.color.matrix = code(b),
+            ID_TRANSFER_CHARACTERISTICS => s.color.transfer = code(b),
+            ID_PRIMARIES => s.color.primaries = code(b),
+            ID_RANGE => {
+                s.color_range = match uint_of(b) {
+                    1 => ColorRange::Limited,
+                    2 => ColorRange::Full,
+                    _ => ColorRange::Unspecified,
+                }
+            }
+            ID_MAX_CLL => light.get_or_insert_with(Default::default).max_cll = level(b),
+            ID_MAX_FALL => light.get_or_insert_with(Default::default).max_fall = level(b),
+            ID_MASTERING_METADATA => s.mastering_display = Some(parse_mastering(b)),
+            _ => {}
+        }
+    }
+    if light.is_some() {
+        s.content_light = light;
+    }
+}
+
+/// A `MasteringMetadata` body: floats (CIE 1931 xy, cd/m²) to ST 2086 units.
+fn parse_mastering(body: &[u8]) -> MasteringDisplay {
+    let mut m = MasteringDisplay::default();
+    for (id, b) in children(body) {
+        let v = float_of(b);
+        let c = MasteringDisplay::chroma_from_f64(v);
+        match id {
+            ID_PRIMARY_R_X => m.red.0 = c,
+            ID_PRIMARY_R_Y => m.red.1 = c,
+            ID_PRIMARY_G_X => m.green.0 = c,
+            ID_PRIMARY_G_Y => m.green.1 = c,
+            ID_PRIMARY_B_X => m.blue.0 = c,
+            ID_PRIMARY_B_Y => m.blue.1 = c,
+            ID_WHITE_POINT_X => m.white_point.0 = c,
+            ID_WHITE_POINT_Y => m.white_point.1 = c,
+            ID_LUMINANCE_MAX => m.max_luminance = MasteringDisplay::luma_from_f64(v),
+            ID_LUMINANCE_MIN => m.min_luminance = MasteringDisplay::luma_from_f64(v),
+            _ => {}
+        }
+    }
+    m
+}
+
+/// A `BlockAdditions` body: one [`BlockAdditional`] per `BlockMore` that has
+/// a payload (`BlockAddID` defaults to 1).
+fn parse_block_additions(body: &[u8]) -> Vec<BlockAdditional> {
+    children(body)
+        .filter(|&(id, _)| id == ID_BLOCK_MORE)
+        .filter_map(|(_, more)| {
+            let mut id = 1;
+            let mut data = None;
+            for (cid, b) in children(more) {
+                match cid {
+                    ID_BLOCK_ADD_ID => id = uint_of(b),
+                    ID_BLOCK_ADDITIONAL => data = Some(b.to_vec()),
+                    _ => {}
+                }
+            }
+            data.map(|data| BlockAdditional { id, data })
+        })
+        .collect()
+}
+
+/// An element header read off the stream: `start` is the absolute offset of
+/// its body.
+#[derive(Clone, Copy)]
+struct ElemHeader {
+    id: u32,
+    size: u64,
+    unknown: bool,
+    start: u64,
+}
+
+/// The input, buffered, with the absolute position tracked (it can't seek).
+struct Source {
+    r: BufReader<Input>,
+    pos: u64,
+}
+
+impl Source {
+    fn byte(&mut self) -> io::Result<Option<u8>> {
+        let mut b = [0u8];
+        loop {
+            match self.r.read(&mut b) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {
+                    self.pos += 1;
+                    return Ok(Some(b[0]));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// The next element header (ID + size vint). `None` at end of input, on
+    /// a truncated header, or on an invalid vint — all of which end a walk.
+    fn header(&mut self) -> io::Result<Option<ElemHeader>> {
+        let Some(first) = self.byte()? else {
+            return Ok(None);
+        };
+        let len = first.leading_zeros() as usize + 1;
+        if len > 4 {
+            return Ok(None);
+        }
+        let mut id = first as u32;
+        for _ in 1..len {
+            let Some(b) = self.byte()? else {
+                return Ok(None);
+            };
+            id = (id << 8) | b as u32;
+        }
+        let Some(first) = self.byte()? else {
+            return Ok(None);
+        };
+        let len = first.leading_zeros() as usize + 1;
+        if len > 8 {
+            return Ok(None);
+        }
+        let mask = (1u64 << (8 - len)) - 1;
+        let mut size = first as u64 & mask;
+        let mut unknown = size == mask;
+        for _ in 1..len {
+            let Some(b) = self.byte()? else {
+                return Ok(None);
+            };
+            size = (size << 8) | b as u64;
+            unknown = unknown && b == 0xFF;
+        }
+        Ok(Some(ElemHeader {
+            id,
+            size,
+            unknown,
+            start: self.pos,
+        }))
+    }
+
+    /// Discard up to `n` bytes (fewer at end of input) without buffering them.
+    fn skip(&mut self, n: u64) -> io::Result<()> {
+        let copied = io::copy(&mut (&mut self.r).take(n), &mut io::sink())?;
+        self.pos += copied;
+        Ok(())
+    }
+
+    /// Read up to `n` bytes (fewer at end of input — a truncated final block
+    /// comes back partial). Allocation tracks bytes actually read, never `n`.
+    fn body(&mut self, n: u64) -> io::Result<Vec<u8>> {
+        let mut v = Vec::new();
+        (&mut self.r).take(n).read_to_end(&mut v)?;
+        self.pos += v.len() as u64;
+        Ok(v)
+    }
+}
+
+/// The Cluster being walked: its end offset (`None` = unknown size, ended by
+/// the next level-1 element) and its base timestamp.
+struct Cluster {
+    end: Option<u64>,
+    ts: i64,
+}
+
+struct MkvDemuxer {
+    src: Source,
+    streams: Vec<Stream>,
+    /// Maps a Matroska track number to our 0-based stream index.
+    track_map: Vec<(u64, usize)>,
+    /// Indexed by stream index; `Some` for H.264 tracks whose CodecPrivate is
+    /// an `avcC` — their blocks are AVCC and get normalised to Annex-B.
+    avc: Vec<Option<AvcConfig>>,
+    /// Indexed by stream index; ASS/SSA subtitle tracks, whose block payloads
+    /// carry `ReadOrder,Layer,Style,…,Text` and get reduced to plain text.
+    ass: Vec<bool>,
+    /// Indexed by stream index; the track's DefaultDuration in nanoseconds
+    /// (0 = none), which a block without its own BlockDuration lasts per frame.
+    default_duration_ns: Vec<u64>,
+    /// Indexed by stream index: the track's CodecDelay in nanoseconds (0: none), the
+    /// encoder's priming, which block timestamps include and packet timestamps don't.
+    codec_delay: Vec<u64>,
+    /// Indexed by stream index: the frame-scope ContentEncodings to undo.
+    codings: Vec<Vec<encoding::Coding>>,
+    /// A track the demuxer must refuse (encrypted, unsupported compression):
+    /// `read_header` fails with this message.
+    refused: Option<String>,
+    /// The rest of a laced block's frames, returned before the walk goes on.
+    laced: VecDeque<Packet>,
+    timestamp_scale: u64,
+    /// Segment duration in `timestamp_scale` ticks (same unit as `time_base`).
+    duration_ticks: Option<i64>,
+    /// Absolute end of the Segment body; `None` = unknown size (runs to EOF).
+    seg_end: Option<u64>,
+    cluster: Option<Cluster>,
+    /// One-element lookahead: a header already read that the next step of
+    /// the walk must handle (the first Cluster after `read_header`, or the
+    /// level-1 element that ended an unknown-size Cluster).
+    pending: Option<ElemHeader>,
+    /// The walk is over (end of Segment, end of input, or corrupt framing).
+    done: bool,
+    parsed: bool,
+}
+
+impl MkvDemuxer {
+    fn new(input: Input) -> MkvDemuxer {
+        MkvDemuxer {
+            src: Source {
+                r: BufReader::with_capacity(READ_BUF, input),
+                pos: 0,
+            },
+            streams: Vec::new(),
+            track_map: Vec::new(),
+            avc: Vec::new(),
+            ass: Vec::new(),
+            default_duration_ns: Vec::new(),
+            codec_delay: Vec::new(),
+            codings: Vec::new(),
+            refused: None,
+            laced: VecDeque::new(),
+            timestamp_scale: 1_000_000, // default: 1 ms
+            duration_ticks: None,
+            seg_end: None,
+            cluster: None,
+            pending: None,
+            done: false,
+            parsed: false,
+        }
+    }
+
+    /// `size` clamped to what is left of the innermost enclosing element with
+    /// a known end (the Cluster being walked, else the Segment).
+    fn bounded(&self, h: &ElemHeader) -> u64 {
+        let end = self.cluster.as_ref().and_then(|c| c.end).or(self.seg_end);
+        match end {
+            Some(end) => h.size.min(end.saturating_sub(h.start)),
+            None => h.size,
+        }
+    }
+
+    /// Skip the EBML header, enter the Segment and parse everything up to the
+    /// first Cluster (Info, Tracks); other elements are streamed past.
+    fn parse_headers(&mut self) -> Result<()> {
+        let no_tracks = || Error::invalid("mkv: no tracks found");
+        if let Some(why) = &self.refused {
+            return Err(Error::unsupported(why.clone()));
+        }
+        if self.done {
+            return Err(no_tracks());
+        }
+        loop {
+            let Some(h) = self.src.header()? else {
+                self.done = true;
+                return Err(no_tracks());
+            };
+            if h.id == ID_SEGMENT {
+                self.seg_end = (!h.unknown).then(|| h.start.saturating_add(h.size));
+                break;
+            }
+            if h.unknown {
+                self.done = true;
+                return Err(no_tracks());
+            }
+            self.src.skip(h.size)?;
+        }
+        loop {
+            if self.seg_end.is_some_and(|end| self.src.pos >= end) {
+                self.done = true;
+                break;
+            }
+            let Some(h) = self.src.header()? else {
+                self.done = true;
+                break;
+            };
+            match h.id {
+                ID_CLUSTER => {
+                    self.pending = Some(h);
+                    break;
+                }
+                // An unknown-size element (only legal for Segment/Cluster):
+                // descend into it, so its children are met one by one.
+                _ if h.unknown => {}
+                ID_INFO | ID_TRACKS => {
+                    let len = self.bounded(&h);
+                    if len > MAX_HEADER_ELEMENT {
+                        self.src.skip(len)?;
+                        continue;
+                    }
+                    let body = self.src.body(len)?;
+                    if h.id == ID_INFO {
+                        self.parse_info(&body);
+                    } else {
+                        self.parse_tracks(&body);
+                    }
+                }
+                // Children of an unknown-size Info/Tracks descended into.
+                ID_TRACK_ENTRY | ID_TIMESTAMP_SCALE | ID_DURATION => {
+                    let len = self.bounded(&h);
+                    if len > MAX_HEADER_ELEMENT {
+                        self.src.skip(len)?;
+                        continue;
+                    }
+                    let body = self.src.body(len)?;
+                    if h.id == ID_TRACK_ENTRY {
+                        self.parse_track_entry(&body);
+                    } else {
+                        self.info_element(h.id, &mut Ebml::new(&body), h.size as usize);
+                    }
+                }
+                _ => {
+                    let len = self.bounded(&h);
+                    self.src.skip(len)?;
+                }
+            }
+        }
+        if let Some(why) = &self.refused {
+            self.done = true;
+            return Err(Error::unsupported(why.clone()));
+        }
+        if self.streams.is_empty() {
+            self.done = true;
+            return Err(no_tracks());
+        }
+        for s in &mut self.streams {
+            s.duration = self.duration_ticks;
+            // Per-stream frame counts would need the whole file read (ffprobe
+            // reports N/A for Matroska too), so `nb_frames` stays `None`.
+        }
+        Ok(())
+    }
+
+    /// Walk Cluster children until a block yields a packet. `None` = done.
+    fn next_packet(&mut self) -> Result<Option<Packet>> {
+        if let Some(p) = self.laced.pop_front() {
+            return Ok(Some(p));
+        }
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            let h = match self.pending.take() {
+                Some(h) => h,
+                None => {
+                    let pos = self.src.pos;
+                    if let Some(Cluster { end: Some(end), .. }) = self.cluster {
+                        if pos >= end {
+                            self.cluster = None;
+                            continue;
+                        }
+                    }
+                    if self.seg_end.is_some_and(|end| pos >= end) {
+                        self.done = true;
+                        continue;
+                    }
+                    match self.src.header()? {
+                        Some(h) => h,
+                        None => {
+                            // Corrupt framing inside a known-size Cluster:
+                            // resync at its end. Anywhere else (or at EOF)
+                            // the walk is over.
+                            match self.cluster.take().and_then(|c| c.end) {
+                                Some(end) if end > self.src.pos => {
+                                    self.src.skip(end - self.src.pos)?;
+                                }
+                                _ => self.done = true,
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Segment level: enter Clusters, stream past everything else.
+            let Some(ts) = self.cluster.as_ref().map(|c| c.ts) else {
+                if h.id == ID_CLUSTER {
+                    let end = (!h.unknown).then(|| h.start.saturating_add(self.bounded(&h)));
+                    self.cluster = Some(Cluster { end, ts: 0 });
+                } else if !h.unknown {
+                    let len = self.bounded(&h);
+                    self.src.skip(len)?;
+                }
+                continue;
+            };
+
+            // Inside a Cluster.
+            if is_level1(h.id) {
+                self.cluster = None;
+                self.pending = Some(h);
+                continue;
+            }
+            if h.unknown {
+                continue; // descend into an unknown-size child
+            }
+            match h.id {
+                ID_TIMESTAMP => {
+                    let body = self.src.body(h.size.min(8))?;
+                    self.src.skip(h.size.saturating_sub(8))?;
+                    let v = Ebml::new(&body).read_uint(h.size.min(8) as usize) as i64;
+                    if let Some(c) = self.cluster.as_mut() {
+                        c.ts = v;
+                    }
+                }
+                ID_SIMPLE_BLOCK | ID_BLOCK_GROUP if h.size <= MAX_BLOCK => {
+                    let body = self.src.body(h.size)?;
+                    if (body.len() as u64) < h.size {
+                        // Input ended inside the (Simple)Block or BlockGroup.
+                        // matroskadec drops such a block (`ebml_read_binary`
+                        // fails a short read; a cut BlockGroup fails its
+                        // nest), so the partial last frame of a truncated
+                        // file is never decoded. The input is exhausted.
+                        self.done = true;
+                        continue;
+                    }
+                    // A laced block yields several frames: return the first,
+                    // queue the rest for the next calls.
+                    let packets = if h.id == ID_SIMPLE_BLOCK {
+                        self.parse_block(&body, ts, 0, None)
+                    } else {
+                        self.parse_block_group(&body, ts)
+                    };
+                    self.laced.extend(packets);
+                    if let Some(p) = self.laced.pop_front() {
+                        return Ok(Some(p));
+                    }
+                }
+                _ => {
+                    let len = self.bounded(&h);
+                    self.src.skip(len)?;
+                }
+            }
+        }
+    }
+
+    fn parse_info(&mut self, data: &[u8]) {
+        let mut e = Ebml::new(data);
+        while e.pos < data.len() {
+            let Some(id) = e.read_id() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
+            self.info_element(id, &mut e, size as usize);
+        }
+    }
+
+    /// One Info child whose body starts at `e.pos`.
+    fn info_element(&mut self, id: u32, e: &mut Ebml, len: usize) {
+        match id {
+            ID_TIMESTAMP_SCALE => self.timestamp_scale = e.read_uint(len),
+            // Duration is a float in `timestamp_scale` ticks — our time_base.
+            ID_DURATION => {
+                let d = e.read_float(len);
+                if d > 0.0 {
+                    self.duration_ticks = Some(d as i64);
+                }
+            }
+            _ => e.skip(len),
+        }
+    }
+
+    fn parse_tracks(&mut self, data: &[u8]) {
+        let mut e = Ebml::new(data);
+        while e.pos < data.len() {
+            let Some(id) = e.read_id() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
+            let entry_end = e.pos.saturating_add(size as usize).min(data.len());
+            if id == ID_TRACK_ENTRY {
+                self.parse_track_entry(&data[e.pos..entry_end]);
+            }
+            e.pos = entry_end;
+        }
+    }
+
+    fn parse_track_entry(&mut self, data: &[u8]) {
+        let mut number = 0u64;
+        let mut codec = String::new();
+        let mut codec_private: Vec<u8> = Vec::new();
+        let mut track_type = 0u64;
+        let (mut width, mut height) = (0u32, 0u32);
+        let (mut rate, mut channels) = (0u32, 0u16);
+        let mut bit_depth = 0u64;
+        let mut default_duration_ns = 0u64;
+        let mut frame_rate = 0.0f64;
+        let mut codec_delay = 0u64;
+        let mut seek_preroll = 0u64;
+        let mut alpha_mode = 0u64;
+        let mut colour: Option<&[u8]> = None;
+        let mut encodings: Option<&[u8]> = None;
+
+        let mut e = Ebml::new(data);
+        while e.pos < data.len() {
+            let Some(id) = e.read_id() else { break };
+            let Some((size, _)) = e.read_size() else {
+                break;
+            };
+            let len = size as usize;
+            match id {
+                ID_TRACK_NUMBER => number = e.read_uint(len),
+                ID_TRACK_TYPE => track_type = e.read_uint(len),
+                ID_CODEC_ID => codec = String::from_utf8_lossy(e.read_bytes(len)).into_owned(),
+                ID_CODEC_PRIVATE => codec_private = e.read_bytes(len).to_vec(),
+                ID_DEFAULT_DURATION => default_duration_ns = e.read_uint(len),
+                ID_CODEC_DELAY => codec_delay = e.read_uint(len),
+                ID_SEEK_PREROLL => seek_preroll = e.read_uint(len),
+                ID_CONTENT_ENCODINGS => encodings = Some(e.read_bytes(len)),
+                ID_VIDEO => {
+                    let mut v = Ebml::at(data, e.pos);
+                    let ve = e.pos.saturating_add(len);
+                    while v.pos < ve {
+                        let Some(vid) = v.read_id() else { break };
+                        let Some((vsz, _)) = v.read_size() else { break };
+                        match vid {
+                            ID_PIXEL_WIDTH => width = v.read_uint(vsz as usize) as u32,
+                            ID_PIXEL_HEIGHT => height = v.read_uint(vsz as usize) as u32,
+                            ID_FRAME_RATE => frame_rate = v.read_float(vsz as usize),
+                            ID_ALPHA_MODE => alpha_mode = v.read_uint(vsz as usize),
+                            ID_COLOUR => colour = Some(v.read_bytes(vsz as usize)),
+                            _ => v.skip(vsz as usize),
+                        }
+                    }
+                    e.skip(len);
+                }
+                ID_AUDIO => {
+                    let mut a = Ebml::at(data, e.pos);
+                    let ae = e.pos.saturating_add(len);
+                    while a.pos < ae {
+                        let Some(aid) = a.read_id() else { break };
+                        let Some((asz, _)) = a.read_size() else { break };
+                        match aid {
+                            ID_SAMPLING_FREQUENCY => rate = a.read_float(asz as usize) as u32,
+                            ID_CHANNELS => channels = a.read_uint(asz as usize) as u16,
+                            ID_BIT_DEPTH => bit_depth = a.read_uint(asz as usize),
+                            _ => a.skip(asz as usize),
+                        }
+                    }
+                    e.skip(len);
+                }
+                _ => e.skip(len),
+            }
+        }
+
+        // ContentEncodings come off before anything reads the CodecPrivate.
+        let codings = match encodings.map(encoding::parse).transpose() {
+            Ok(c) => c.unwrap_or_default(),
+            Err(why) => {
+                self.refused
+                    .get_or_insert(format!("mkv: track {number} ({codec}) {why}"));
+                encoding::Codings::default()
+            }
+        };
+        if !codings.private.is_empty() && !codec_private.is_empty() {
+            match encoding::decode(&codings.private, &codec_private) {
+                Some(p) => codec_private = p,
+                None => {
+                    self.refused.get_or_insert(format!(
+                        "mkv: track {number} ({codec}): its compressed CodecPrivate does not \
+                         decompress"
+                    ));
+                }
+            }
+        }
+        self.codings.push(codings.frames);
+
+        let codec_id = map_codec(&codec);
+        let is_ass = matches!(codec.as_str(), "S_TEXT/ASS" | "S_TEXT/SSA");
+        self.ass.push(is_ass);
+        // A video track without DefaultDuration but with the (deprecated)
+        // FrameRate gets one derived from it, as matroskadec does.
+        if default_duration_ns == 0 && track_type == 1 && frame_rate > 0.0 {
+            let ns = 1e9 / frame_rate;
+            if ns < u64::MAX as f64 {
+                default_duration_ns = ns as u64;
+            }
+        }
+        self.default_duration_ns.push(default_duration_ns);
+        self.codec_delay.push(codec_delay);
+        let index = self.streams.len();
+        let mut s = Stream::new(index, codec_id);
+        s.media_type = match track_type {
+            1 => MediaType::Video,
+            2 => MediaType::Audio,
+            17 => MediaType::Subtitle,
+            _ => MediaType::Data,
+        };
+        s.width = width;
+        s.height = height;
+        s.sample_rate = rate;
+        s.channels = channels;
+        s.codec_delay_ns = codec_delay;
+        s.seek_preroll_ns = seek_preroll;
+        if s.media_type == MediaType::Video {
+            s.alpha_mode = alpha_mode != 0;
+            if let Some(colour) = colour {
+                parse_colour(&mut s, colour);
+            }
+        }
+        // PCM: the codec string + bit depth decide the sample layout.
+        if codec_id == CodecId::Pcm {
+            s.sample_format = match (codec.as_str(), bit_depth) {
+                ("A_PCM/FLOAT/IEEE", _) => Some(SampleFormat::F32),
+                (_, 0 | 16) => Some(SampleFormat::S16),
+                _ => None, // 24-bit int etc. — no rff layout yet
+            };
+        }
+        // H.264 and HEVC are stored length-prefixed (CodecPrivate = `avcC` /
+        // `hvcC`). Normalise to rff's Annex-B packet contract — same as
+        // rff-format-mp4 — so extradata stays empty and the parameter sets
+        // ride in the keyframe packets.
+        let avc = match codec_id {
+            CodecId::H264 => parse_avcc(&codec_private),
+            CodecId::Hevc => rff_format::hvc::parse_hvcc(&codec_private),
+            _ => None,
+        };
+        s.extradata = if avc.is_some() {
+            Vec::new()
+        } else if codec_id == CodecId::Vorbis {
+            // Matroska stores the three Vorbis setup headers Xiph-laced; rff's
+            // decoder contract wants them u32-LE length-prefixed (the Ogg
+            // demuxer's packing). Convert, or the decoder can't configure.
+            xiph_to_packed(&codec_private).unwrap_or(codec_private)
+        } else {
+            codec_private
+        };
+        self.avc.push(avc);
+        // Matroska timestamps are in `timestamp_scale` ns; expose ms time base.
+        s.time_base = Rational::new(1, (1_000_000_000 / self.timestamp_scale.max(1)) as i32);
+        self.track_map.push((number, index));
+        self.streams.push(s);
+    }
+
+    /// A BlockGroup body. BlockDuration, DiscardPadding, ReferenceBlock and
+    /// BlockAdditions may come before or after the Block: collect them all,
+    /// then emit (subtitle cues need their duration, a stream's last audio
+    /// block its padding). A BlockGroup's Block has no keyframe flag: as in
+    /// matroskadec, it is a keyframe exactly when no ReferenceBlock is present.
+    fn parse_block_group(&self, group: &[u8], cluster_ts: i64) -> Vec<Packet> {
+        let mut g = Ebml::new(group);
+        let mut block: Option<&[u8]> = None;
+        let mut duration = 0i64;
+        let mut discard_ns = 0i64;
+        let mut referenced = false;
+        let mut additions = Vec::new();
+        while g.pos < group.len() {
+            let Some(gid) = g.read_id() else { break };
+            let Some((gsz, _)) = g.read_size() else { break };
+            match gid {
+                ID_BLOCK => block = Some(g.read_bytes(gsz as usize)),
+                ID_BLOCK_DURATION => duration = g.read_uint(gsz as usize) as i64,
+                ID_DISCARD_PADDING => discard_ns = g.read_int(gsz as usize),
+                ID_REFERENCE_BLOCK => {
+                    referenced = true;
+                    g.skip(gsz as usize);
+                }
+                ID_BLOCK_ADDITIONS => {
+                    additions.extend(parse_block_additions(g.read_bytes(gsz as usize)))
+                }
+                _ => g.skip(gsz as usize),
+            }
+        }
+        let Some(block) = block else {
+            return Vec::new();
+        };
+        let mut packets = self.parse_block(block, cluster_ts, duration, Some(!referenced));
+        // Additions describe the block; a laced one shares them out to every
+        // frame, as matroskadec does (blocks with additions are not laced in
+        // practice).
+        if !additions.is_empty() {
+            for p in &mut packets {
+                p.additions = additions.clone();
+            }
+        }
+        // DiscardPadding trims the end of the block, so it belongs to the
+        // block's last frame (the only one when, as usual, it is not laced).
+        if let Some(last) = packets.last_mut() {
+            let rate = self
+                .streams
+                .get(last.stream_index)
+                .map_or(0, |s| s.sample_rate);
+            last.discard_padding = discard_samples(discard_ns, rate);
+        }
+        packets
+    }
+
+    /// Parse a (Simple)Block body: track vint, int16 relative timestamp, flags,
+    /// then the frame payload, split into its frames when the block is laced.
+    /// `duration` is the BlockGroup's BlockDuration (0 when absent);
+    /// `keyframe` overrides the flags byte (a BlockGroup's is decided by its
+    /// ReferenceBlocks). Frames under a ContentEncoding are decoded first; one
+    /// that fails to (corrupt zlib) is dropped.
+    fn parse_block(
+        &self,
+        block: &[u8],
+        cluster_ts: i64,
+        duration: i64,
+        keyframe: Option<bool>,
+    ) -> Vec<Packet> {
+        let mut b = Ebml::new(block);
+        let Some((track_num, _)) = b.read_size() else {
+            return Vec::new();
+        };
+        if b.pos + 3 > block.len() {
+            return Vec::new();
+        }
+        let rel = i16::from_be_bytes([block[b.pos], block[b.pos + 1]]) as i64;
+        b.pos += 2;
+        let flags = block[b.pos];
+        b.pos += 1;
+        let lacing = (flags >> 1) & 0x03;
+        let keyframe = keyframe.unwrap_or(flags & 0x80 != 0);
+        let Some(&(_, index)) = self.track_map.iter().find(|(n, _)| *n == track_num) else {
+            return Vec::new();
+        };
+        // A block whose lace sizes don't add up is dropped, as FFmpeg drops it.
+        let Some(laces) = split_laces(&block[b.pos..], lacing) else {
+            return Vec::new();
+        };
+        // As matroskadec: a block without a BlockDuration lasts DefaultDuration per frame,
+        // the duration is shared out between the frames, and each frame's timestamp follows
+        // the previous one's; after a frame of zero duration the rest have none.
+        let count = laces.len() as i64;
+        let block_duration = if duration > 0 {
+            duration
+        } else {
+            let default = self.default_duration_ns.get(index).copied().unwrap_or(0);
+            (u128::from(default) * count as u128 / u128::from(self.timestamp_scale.max(1)))
+                .min(i64::MAX as u128) as i64
+        };
+        // As matroskadec, the CodecDelay comes off every timestamp (ffmpeg's muxer adds it
+        // on), rounded to the nearest tick: an AAC or Opus stream's first packet is negative.
+        let delay = self.codec_delay.get(index).copied().unwrap_or(0);
+        let scale = u128::from(self.timestamp_scale.max(1));
+        let delay = ((2 * u128::from(delay) + scale) / (2 * scale)).min(i64::MAX as u128) as i64;
+        let mut pts = Some(cluster_ts.wrapping_add(rel).saturating_sub(delay));
+        let mut packets = Vec::with_capacity(laces.len());
+        for (n, raw) in laces.into_iter().enumerate() {
+            let n = n as i64;
+            let lace_duration = block_duration.saturating_mul(n + 1) / count
+                - block_duration.saturating_mul(n) / count;
+            let this_pts = pts;
+            pts = match pts {
+                Some(t) if lace_duration != 0 => Some(t.saturating_add(lace_duration)),
+                _ => None,
+            };
+            let decoded;
+            let raw = match self.codings.get(index).filter(|c| !c.is_empty()) {
+                Some(codings) => match encoding::decode(codings, raw) {
+                    Some(d) => {
+                        decoded = d;
+                        &decoded[..]
+                    }
+                    None => continue,
+                },
+                None => raw,
+            };
+            // H.264: AVCC → Annex-B, prepending SPS/PPS on keyframes so the
+            // decoder is self-contained (mirrors the MP4 demuxer).
+            let data = match self.avc.get(index).and_then(|a| a.as_ref()) {
+                Some(cfg) => {
+                    let mut out = Vec::with_capacity(cfg.headers_annexb.len() + raw.len() + 16);
+                    if keyframe {
+                        out.extend_from_slice(&cfg.headers_annexb);
+                    }
+                    avcc_to_annexb(raw, cfg.nal_len, &mut out);
+                    out
+                }
+                // ASS blocks: `ReadOrder,Layer,Style,Name,ML,MR,MV,Effect,Text` —
+                // reduce to the plain text our subtitle contract carries.
+                None if self.ass.get(index).copied().unwrap_or(false) => {
+                    rff_subtitle::ass_dialogue_text(&String::from_utf8_lossy(raw), 8).into_bytes()
+                }
+                None => raw.to_vec(),
+            };
+            let mut packet = Packet::from_data(index, data);
+            packet.pts = this_pts;
+            packet.duration = lace_duration.max(0);
+            packet.flags.keyframe = keyframe;
+            packets.push(packet);
+        }
+        packets
+    }
+}
+
+/// A BlockGroup's `DiscardPadding` (signed nanoseconds of audio to drop from
+/// the end of the block) as samples at `rate`, rounded to nearest the way
+/// FFmpeg's `matroskadec.c` rescales it. Zero or negative padding (which
+/// FFmpeg's decoder ignores), or an unknown rate, means none.
+fn discard_samples(ns: i64, rate: u32) -> u32 {
+    if ns <= 0 || rate == 0 {
+        return 0;
+    }
+    let samples = (ns as u128 * rate as u128 + 500_000_000) / 1_000_000_000;
+    u32::try_from(samples).unwrap_or(u32::MAX)
+}
+
+/// Splits a block payload (after the flags byte) into its frames per the block's lacing
+/// (Matroska "Block Lacing"; FFmpeg's `matroska_parse_laces`): 0 none, 1 Xiph, 2 fixed
+/// size, 3 EBML. `None` if the lace sizes don't fit the payload.
+fn split_laces(data: &[u8], lacing: u8) -> Option<Vec<&[u8]>> {
+    if lacing == 0 {
+        return Some(vec![data]);
+    }
+    let count = *data.first()? as usize + 1;
+    let mut pos = 1usize;
+    // The sizes of all frames but the last, which gets what the others leave.
+    let mut sizes = Vec::with_capacity(count);
+    let total = match lacing {
+        1 => {
+            for _ in 0..count - 1 {
+                let mut size = 0usize;
+                loop {
+                    let byte = *data.get(pos)?;
+                    pos += 1;
+                    size += byte as usize;
+                    if byte != 0xFF {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+            sizes.iter().sum()
+        }
+        2 => {
+            let rest = data.len() - pos;
+            if rest % count != 0 {
+                return None;
+            }
+            sizes.resize(count - 1, rest / count);
+            rest / count * (count - 1)
+        }
+        _ => {
+            // EBML: the first size as an unsigned vint, then signed differences. ffmpeg
+            // reads them with ebml_read_num, which takes an all-ones value at face value
+            // (only element sizes treat it as "unknown"), and reads the first size even
+            // for a single frame, which then gets the payload less that size.
+            let mut e = Ebml::at(data, pos);
+            let (first, _) = e.read_size()?;
+            if first > i32::MAX as u64 {
+                return None;
+            }
+            let mut size = first as i64;
+            let mut total = first as usize;
+            if count > 1 {
+                sizes.push(size as usize);
+            }
+            for _ in 1..count.saturating_sub(1) {
+                let start = e.pos;
+                let (raw, _) = e.read_size()?;
+                let width = (e.pos - start) as u32;
+                size += raw as i64 - ((1i64 << (7 * width - 1)) - 1);
+                if !(0..=i32::MAX as i64).contains(&size) {
+                    return None;
+                }
+                sizes.push(size as usize);
+                total = total.checked_add(size as usize)?;
+            }
+            pos = e.pos;
+            total
+        }
+    };
+    sizes.push((data.len() - pos).checked_sub(total)?);
+    let mut frames = Vec::with_capacity(count);
+    for size in sizes {
+        frames.push(data.get(pos..pos + size)?);
+        pos += size;
+    }
+    Some(frames)
+}
+
+/// Convert a Xiph-laced Vorbis CodecPrivate (count-1, lace sizes, packets) to
+/// rff's u32-LE length-prefixed `extradata` packing.
+fn xiph_to_packed(private: &[u8]) -> Option<Vec<u8>> {
+    let count = *private.first()? as usize + 1;
+    let mut sizes = Vec::with_capacity(count);
+    let mut i = 1;
+    for _ in 0..count - 1 {
+        let mut len = 0usize;
+        loop {
+            let b = *private.get(i)? as usize;
+            i += 1;
+            len += b;
+            if b != 255 {
+                break;
+            }
+        }
+        sizes.push(len);
+    }
+    let head: usize = sizes.iter().sum();
+    sizes.push(private.len().checked_sub(i + head)?); // last packet: remainder
+    let mut out = Vec::new();
+    for len in sizes {
+        let packet = private.get(i..i + len)?;
+        out.extend_from_slice(&(len as u32).to_le_bytes());
+        out.extend_from_slice(packet);
+        i += len;
+    }
+    Some(out)
+}
+
+impl Demuxer for MkvDemuxer {
+    fn read_header(&mut self) -> Result<Vec<Stream>> {
+        if !self.parsed {
+            self.parse_headers()?;
+            self.parsed = true;
+        }
+        Ok(self.streams.clone())
+    }
+
+    fn read_packet(&mut self) -> Result<Packet> {
+        if !self.parsed {
+            self.read_header()?;
+        }
+        self.next_packet()?.ok_or(Error::Eof)
+    }
+}
+
+fn map_codec(codec: &str) -> CodecId {
+    match codec {
+        "V_AV1" => CodecId::Avif, // our AV1 (rav1d) decoder
+        "V_VP9" => CodecId::Vp9,
+        "V_VP8" => CodecId::Vp8,
+        "V_MPEG4/ISO/AVC" => CodecId::H264,
+        "V_MPEGH/ISO/HEVC" => CodecId::Hevc,
+        "A_OPUS" => CodecId::Opus,
+        "A_VORBIS" => CodecId::Vorbis,
+        "A_AAC" => CodecId::Aac,
+        "A_FLAC" => CodecId::Flac,
+        "A_MPEG/L3" => CodecId::Mp3,
+        "A_PCM/INT/LIT" | "A_PCM/FLOAT/IEEE" => CodecId::Pcm,
+        "A_AC3" | "A_AC3/BSID9" | "A_AC3/BSID10" => CodecId::Ac3,
+        "A_EAC3" => CodecId::Eac3,
+        "A_ALAC" => CodecId::Alac,
+        // ASS/SSA tracks are reduced to plain text at block level, so they
+        // surface as SubRip-contract cues.
+        "S_TEXT/UTF8" | "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::Subrip,
+        "S_TEXT/WEBVTT" => CodecId::WebVtt,
+        _ => CodecId::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_element_ids_keeping_marker() {
+        let mut e = Ebml::new(&[0x1A, 0x45, 0xDF, 0xA3]);
+        assert_eq!(e.read_id(), Some(0x1A45_DFA3)); // EBML, 4-byte id
+        let mut e = Ebml::new(&[0x83]);
+        assert_eq!(e.read_id(), Some(0x83)); // TrackType, 1-byte id
+        let mut e = Ebml::new(&[0x63, 0xA2]);
+        assert_eq!(e.read_id(), Some(0x63A2)); // CodecPrivate, 2-byte id
+    }
+
+    #[test]
+    fn reads_sizes_stripping_marker() {
+        // 1-byte size 0x82 → value 2.
+        let mut e = Ebml::new(&[0x82]);
+        assert_eq!(e.read_size(), Some((2, false)));
+        // 2-byte size 0x40 0x07 → value 7.
+        let mut e = Ebml::new(&[0x40, 0x07]);
+        assert_eq!(e.read_size(), Some((7, false)));
+        // All-ones 0xFF → unknown size.
+        let mut e = Ebml::new(&[0xFF]);
+        assert_eq!(e.read_size(), Some((0x7F, true)));
+    }
+
+    #[test]
+    fn probe_detects_ebml_magic() {
+        assert_eq!(probe_mkv(&[0x1A, 0x45, 0xDF, 0xA3, 0x00]), 90);
+        assert_eq!(probe_mkv(&[0x00, 0x00]), 0);
+    }
+
+    // ---- mux → demux round trips ------------------------------------------
+
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mux_streams(
+        webm: bool,
+        streams: &[Stream],
+        packets: &[Packet],
+    ) -> std::result::Result<Vec<u8>, Error> {
+        use rff_format::Muxer;
+        let sink = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+        let mut mux = MkvMuxer::new(Box::new(sink.clone()), webm);
+        mux.write_header(streams)?;
+        for p in packets {
+            mux.write_packet(p)?;
+        }
+        mux.write_trailer()?;
+        let file = sink.0.lock().unwrap().clone();
+        Ok(file)
+    }
+
+    fn pkt(stream: usize, pts: i64, key: bool, data: &[u8]) -> Packet {
+        let mut p = Packet::from_data(stream, data.to_vec());
+        p.pts = Some(pts);
+        p.flags.keyframe = key;
+        p
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_vp9_opus() {
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 320;
+        v.height = 240;
+        let mut a = Stream::new(1, CodecId::Opus);
+        a.sample_rate = 48_000;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 48_000); // audio pts in samples
+
+        let packets = [
+            pkt(0, 0, true, &[0x11; 100]),
+            pkt(1, 0, true, &[0x22; 40]),
+            pkt(1, 960, true, &[0x33; 41]),
+            pkt(0, 33, false, &[0x44; 50]),
+        ];
+        let file = mux_streams(false, &[v, a], &packets).unwrap();
+        assert_eq!(probe_mkv(&file), 90);
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].codec_id, CodecId::Vp9);
+        assert_eq!((streams[0].width, streams[0].height), (320, 240));
+        assert_eq!(streams[1].codec_id, CodecId::Opus);
+        assert_eq!(streams[1].sample_rate, 48_000);
+        assert_eq!(streams[1].channels, 2);
+        assert!(streams[1].extradata.starts_with(b"OpusHead"));
+
+        // Blocks come back in timestamp order with data + keyframes intact.
+        let p1 = dem.read_packet().unwrap();
+        assert_eq!(p1.data, vec![0x11; 100]);
+        assert!(p1.flags.keyframe);
+        let p2 = dem.read_packet().unwrap();
+        assert_eq!(p2.data, vec![0x22; 40]);
+        let p3 = dem.read_packet().unwrap();
+        assert_eq!(p3.data, vec![0x33; 41]);
+        assert_eq!(p3.pts, Some(20)); // 960 samples @48 kHz = 20 ms
+        let p4 = dem.read_packet().unwrap();
+        assert_eq!(p4.data, vec![0x44; 50]);
+        assert_eq!(p4.pts, Some(33));
+        assert!(!p4.flags.keyframe);
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_h264_as_annexb() {
+        let mut v = Stream::new(0, CodecId::H264);
+        v.width = 64;
+        v.height = 64;
+        // Annex-B keyframe: SPS + PPS + IDR slice.
+        let mut sample = Vec::new();
+        for nal in [
+            &[0x67u8, 0xAA, 0xBB][..],
+            &[0x68, 0xCC][..],
+            &[0x65, 1, 2, 3][..],
+        ] {
+            sample.extend_from_slice(&[0, 0, 0, 1]);
+            sample.extend_from_slice(nal);
+        }
+        let file = mux_streams(false, &[v], &[pkt(0, 0, true, &sample)]).unwrap();
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[0].codec_id, CodecId::H264);
+        assert!(streams[0].extradata.is_empty()); // normalised to Annex-B
+        let p = dem.read_packet().unwrap();
+        // Keyframe comes back with SPS/PPS prepended, then the slice.
+        assert_eq!(p.data, sample);
+    }
+
+    #[test]
+    fn webm_refuses_non_webm_codecs() {
+        let s = Stream::new(0, CodecId::H264);
+        let err = mux_streams(true, &[s], &[]).unwrap_err();
+        assert!(err.to_string().contains("webm"), "got: {err}");
+    }
+
+    #[test]
+    fn mux_demux_roundtrips_subtitles_with_duration() {
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 16;
+        v.height = 16;
+        let s = Stream::new(1, CodecId::Subrip);
+        let mut cue = pkt(1, 500, true, b"Hello, Matroska!");
+        cue.duration = 1200;
+        let file = mux_streams(false, &[v, s], &[pkt(0, 0, true, &[0x11; 10]), cue]).unwrap();
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams[1].codec_id, CodecId::Subrip);
+        assert_eq!(streams[1].media_type, MediaType::Subtitle);
+        let _video = dem.read_packet().unwrap();
+        let p = dem.read_packet().unwrap();
+        assert_eq!(p.data, b"Hello, Matroska!");
+        assert_eq!(p.pts, Some(500));
+        assert_eq!(p.duration, 1200);
+    }
+
+    // ---- laced blocks (hand-built: the muxer never laces) ---------------------
+
+    /// An EBML element with an 8-byte size.
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = id
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|&b| b == 0)
+            .collect();
+        out.push(0x01);
+        out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A file with one audio track (number 1, 1 ms ticks) and one Cluster at 1000 ms:
+    /// `entry` holds extra TrackEntry children, `blocks` the Cluster's blocks.
+    fn audio_file(codec: &str, entry: &[u8], blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut track = [
+            el(ID_TRACK_NUMBER, &[1]),
+            el(ID_TRACK_TYPE, &[2]),
+            el(ID_CODEC_ID, codec.as_bytes()),
+        ]
+        .concat();
+        track.extend_from_slice(entry);
+        let mut cluster = el(ID_TIMESTAMP, &1000u16.to_be_bytes());
+        for b in blocks {
+            cluster.extend_from_slice(b);
+        }
+        let segment = [
+            el(
+                ID_INFO,
+                &el(ID_TIMESTAMP_SCALE, &1_000_000u32.to_be_bytes()),
+            ),
+            el(ID_TRACKS, &el(ID_TRACK_ENTRY, &track)),
+            el(ID_CLUSTER, &cluster),
+        ]
+        .concat();
+        [
+            el(0x1A45_DFA3, &el(0x4282, b"matroska")),
+            el(ID_SEGMENT, &segment),
+        ]
+        .concat()
+    }
+
+    /// A Block body on track 1: relative timestamp, flags (lacing bits included), payload.
+    fn track1_block(rel: i16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        [&[0x81][..], &rel.to_be_bytes(), &[flags], payload].concat()
+    }
+
+    fn demux_packets(file: Vec<u8>) -> Vec<Packet> {
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        dem.read_header().unwrap();
+        std::iter::from_fn(|| dem.read_packet().ok()).collect()
+    }
+
+    /// Frame `n` of a test: `len` bytes of `n`.
+    fn frame(n: u8, len: usize) -> Vec<u8> {
+        vec![n; len]
+    }
+
+    /// Xiph lacing: 2 more frames, sizes 300 (255 + 45) and 7, the last one the rest.
+    fn xiph_laced() -> Vec<u8> {
+        [
+            &[2, 255, 45, 7][..],
+            &frame(1, 300),
+            &frame(2, 7),
+            &frame(3, 20),
+        ]
+        .concat()
+    }
+
+    /// EBML lacing: 3 more frames, first size 100, then differences -10 and +40.
+    fn ebml_laced() -> Vec<u8> {
+        let sizes = [3, 0x80 | 100, 0x80 | (63 - 10), 0x80 | (63 + 40)];
+        [
+            &sizes[..],
+            &frame(4, 100),
+            &frame(5, 90),
+            &frame(6, 130),
+            &frame(7, 5),
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn laced_blocks_split_into_frames_timed_by_default_duration() {
+        // 1024 samples at 48 kHz per frame, as mkvmerge writes it for AAC.
+        let entry = el(ID_DEFAULT_DURATION, &21_333_333u32.to_be_bytes());
+        let fixed = [&[1][..], &frame(8, 16), &frame(9, 16)].concat();
+        let file = audio_file(
+            "A_AAC",
+            &entry,
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x82, &xiph_laced())),
+                el(ID_SIMPLE_BLOCK, &track1_block(64, 0x06, &ebml_laced())),
+                el(ID_SIMPLE_BLOCK, &track1_block(149, 0x84, &fixed)),
+                el(ID_SIMPLE_BLOCK, &track1_block(192, 0x80, &frame(10, 3))),
+            ],
+        );
+        let packets = demux_packets(file);
+        let got: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data[0], p.data.len(), p.pts, p.duration, p.flags.keyframe))
+            .collect();
+        // As ffmpeg: the block lasts DefaultDuration per frame (3 frames: 63 ms, 4: 85 ms),
+        // shared out between the frames, each starting where the previous one ends; every
+        // frame carries the block's keyframe flag.
+        assert_eq!(
+            got,
+            [
+                (1, 300, Some(1000), 21, true),
+                (2, 7, Some(1021), 21, true),
+                (3, 20, Some(1042), 21, true),
+                (4, 100, Some(1064), 21, false),
+                (5, 90, Some(1085), 21, false),
+                (6, 130, Some(1106), 21, false),
+                (7, 5, Some(1127), 22, false),
+                (8, 16, Some(1149), 21, true),
+                (9, 16, Some(1170), 21, true),
+                (10, 3, Some(1192), 21, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn laced_blocks_without_a_default_duration_time_only_their_first_frame() {
+        let group = el(
+            ID_BLOCK_GROUP,
+            &[
+                el(ID_BLOCK, &track1_block(100, 0x02, &xiph_laced())),
+                el(ID_BLOCK_DURATION, &[50]),
+            ]
+            .concat(),
+        );
+        let file = audio_file(
+            "A_AAC",
+            &[],
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x86, &ebml_laced())),
+                group,
+            ],
+        );
+        let got: Vec<_> = demux_packets(file)
+            .iter()
+            .map(|p| (p.data[0], p.data.len(), p.pts, p.duration))
+            .collect();
+        // ffmpeg leaves the rest without a timestamp (its generic layer guesses them later);
+        // a BlockDuration is shared out like a DefaultDuration.
+        assert_eq!(
+            got,
+            [
+                (4, 100, Some(1000), 0),
+                (5, 90, None, 0),
+                (6, 130, None, 0),
+                (7, 5, None, 0),
+                (1, 300, Some(1100), 16),
+                (2, 7, Some(1116), 17),
+                (3, 20, Some(1133), 17),
+            ]
+        );
+    }
+
+    #[test]
+    fn codec_delay_comes_off_every_timestamp() {
+        // Opus pre-skip: 312 samples at 48 kHz, 6.5 ms, which rounds to 7.
+        let file = audio_file(
+            "A_OPUS",
+            &el(ID_CODEC_DELAY, &6_500_000u32.to_be_bytes()),
+            &[
+                el(ID_SIMPLE_BLOCK, &track1_block(0, 0x80, &frame(1, 3))),
+                el(ID_SIMPLE_BLOCK, &track1_block(20, 0x80, &frame(2, 3))),
+            ],
+        );
+        let pts: Vec<_> = demux_packets(file).iter().map(|p| p.pts).collect();
+        assert_eq!(pts, [Some(993), Some(1013)]);
+
+        // AAC priming, 1024 samples at 48 kHz (21.33 ms): laced frames follow the first.
+        let entry = [
+            el(ID_DEFAULT_DURATION, &21_333_333u32.to_be_bytes()),
+            el(ID_CODEC_DELAY, &21_333_333u32.to_be_bytes()),
+        ]
+        .concat();
+        let file = audio_file(
+            "A_AAC",
+            &entry,
+            &[el(ID_SIMPLE_BLOCK, &track1_block(0, 0x82, &xiph_laced()))],
+        );
+        let pts: Vec<_> = demux_packets(file).iter().map(|p| p.pts).collect();
+        assert_eq!(pts, [Some(979), Some(1000), Some(1021)]);
+    }
+
+    #[test]
+    fn malformed_laces_drop_their_block() {
+        // (lacing, payload after the flags byte)
+        let bad: [(u8, &[u8]); 6] = [
+            (1, &[2, 255, 255, 10, 0, 0, 0]), // Xiph sizes past the end
+            (2, &[2, 0, 0, 0, 0]),            // fixed: 4 bytes in 3 frames
+            (3, &[2, 0x85, 0x80, 0, 0, 0]),   // EBML: 5 - 63 is negative
+            (3, &[1, 0x40, 0x10, 0, 0, 0]),   // EBML: first frame larger than the block
+            (3, &[1, 0x00, 0, 0]),            // EBML: invalid vint
+            (1, &[]),                         // no lace count
+        ];
+        let mut blocks: Vec<_> = bad
+            .iter()
+            .map(|&(lacing, payload)| {
+                el(
+                    ID_SIMPLE_BLOCK,
+                    &track1_block(0, 0x80 | lacing << 1, payload),
+                )
+            })
+            .collect();
+        blocks.push(el(ID_SIMPLE_BLOCK, &track1_block(5, 0x80, &frame(42, 4))));
+        let packets = demux_packets(audio_file("A_AAC", &[], &blocks));
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            (&packets[0].data[..], packets[0].pts),
+            (&frame(42, 4)[..], Some(1005))
+        );
+    }
+
+    #[test]
+    fn lace_sizes_follow_ffmpeg_at_the_edges() {
+        // A single frame in Xiph lacing is the whole rest.
+        assert_eq!(split_laces(&[0, 1, 2, 3], 1), Some(vec![&[1u8, 2, 3][..]]));
+        // A single EBML-laced frame still has its size read, and gets the rest less it.
+        assert_eq!(
+            split_laces(&[0, 0x81, 7, 8, 9], 3),
+            Some(vec![&[7u8, 8][..]])
+        );
+        // An all-ones EBML lace size is a size (127), not "unknown".
+        let data = [&[1, 0xFF][..], &frame(1, 127), &frame(2, 3)].concat();
+        let frames = split_laces(&data, 3).unwrap();
+        assert_eq!((frames[0].len(), frames[1].len()), (127, 3));
+        // Empty frames are allowed, including the last.
+        assert_eq!(split_laces(&[1, 0], 1), Some(vec![&[][..], &[][..]]));
+    }
+
+    #[test]
+    fn vorbis_xiph_private_unpacks_to_rff_packing() {
+        // 3 headers, first 300 bytes (lacing needs 255-continuation).
+        let h0 = vec![1u8; 300];
+        let h1 = vec![2u8; 10];
+        let h2 = vec![3u8; 5];
+        let mut private = vec![2u8, 255, 45, 10];
+        private.extend_from_slice(&h0);
+        private.extend_from_slice(&h1);
+        private.extend_from_slice(&h2);
+        let packed = xiph_to_packed(&private).unwrap();
+        assert_eq!(&packed[0..4], &300u32.to_le_bytes());
+        assert_eq!(packed.len(), 3 * 4 + 300 + 10 + 5);
+        assert_eq!(&packed[4 + 300..4 + 300 + 4], &10u32.to_le_bytes());
+    }
+
+    // ---- golden fixtures: streaming must reproduce the buffered demuxer ----
+
+    /// Deterministic byte source for fixture payloads.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        /// `n` bytes, never zero (so H.264 NALs carry no start-code emulation).
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| (self.next() as u8) | 0x10).collect()
+        }
+    }
+
+    fn fnv(data: &[u8]) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in data {
+            h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    /// Everything observable about a demux (minus `nb_frames`), as text.
+    fn fingerprint(file: Vec<u8>) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = match dem.read_header() {
+            Ok(s) => s,
+            Err(e) => return format!("ERR {e}\n"),
+        };
+        for s in &streams {
+            writeln!(
+                out,
+                "S{} {:?} {:?} {}x{} {}Hz {}ch {:?} xd={}:{:x} tb={}/{} dur={:?}",
+                s.index,
+                s.codec_id,
+                s.media_type,
+                s.width,
+                s.height,
+                s.sample_rate,
+                s.channels,
+                s.sample_format,
+                s.extradata.len(),
+                fnv(&s.extradata),
+                s.time_base.num,
+                s.time_base.den,
+                s.duration
+            )
+            .unwrap();
+        }
+        for _ in 0..1_000_000 {
+            match dem.read_packet() {
+                Ok(p) => writeln!(
+                    out,
+                    "P{} pts={:?} dts={:?} d={} k={} tb={}/{} {}:{:x}",
+                    p.stream_index,
+                    p.pts,
+                    p.dts,
+                    p.duration,
+                    p.flags.keyframe,
+                    p.time_base.num,
+                    p.time_base.den,
+                    p.data.len(),
+                    fnv(&p.data)
+                )
+                .unwrap(),
+                Err(Error::Eof) => break,
+                Err(e) => {
+                    writeln!(out, "PERR {e}").unwrap();
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn fx_vp9_opus() -> Vec<u8> {
+        let mut r = Lcg(1);
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 320;
+        v.height = 240;
+        let mut a = Stream::new(1, CodecId::Opus);
+        a.sample_rate = 48_000;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 48_000);
+        let mut packets = Vec::new();
+        for i in 0..90i64 {
+            let n = 50 + (r.next() % 5000) as usize;
+            packets.push(pkt(0, i * 33, i % 30 == 0, &r.bytes(n)));
+        }
+        for i in 0..150i64 {
+            let n = 40 + (r.next() % 160) as usize;
+            let mut p = pkt(1, i * 960, true, &r.bytes(n));
+            p.duration = 960;
+            packets.push(p);
+        }
+        mux_streams(false, &[v, a], &packets).unwrap()
+    }
+
+    fn fx_h264() -> Vec<u8> {
+        let mut r = Lcg(2);
+        let mut v = Stream::new(0, CodecId::H264);
+        v.width = 64;
+        v.height = 48;
+        let mut packets = Vec::new();
+        for i in 0..60i64 {
+            let key = i % 25 == 0;
+            let mut sample = Vec::new();
+            let mut nals: Vec<Vec<u8>> = Vec::new();
+            if key {
+                nals.push([&[0x67u8, 0x42, 0x00, 0x1E][..], &r.bytes(6)].concat());
+                nals.push([&[0x68u8][..], &r.bytes(3)].concat());
+                nals.push([&[0x65u8][..], &r.bytes(900)].concat());
+            } else {
+                nals.push([&[0x06u8][..], &r.bytes(5)].concat()); // SEI
+                let n = 20 + (r.next() % 400) as usize;
+                nals.push([&[0x41u8][..], &r.bytes(n)].concat());
+            }
+            for nal in nals {
+                sample.extend_from_slice(&[0, 0, 0, 1]);
+                sample.extend_from_slice(&nal);
+            }
+            packets.push(pkt(0, i * 40, key, &sample));
+        }
+        mux_streams(false, &[v], &packets).unwrap()
+    }
+
+    fn fx_vorbis() -> Vec<u8> {
+        let mut r = Lcg(3);
+        let mut a = Stream::new(0, CodecId::Vorbis);
+        a.sample_rate = 44_100;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 44_100);
+        for h in [r.bytes(30), r.bytes(300), r.bytes(1000)] {
+            a.extradata
+                .extend_from_slice(&(h.len() as u32).to_le_bytes());
+            a.extradata.extend_from_slice(&h);
+        }
+        let packets: Vec<Packet> = (0..100i64)
+            .map(|i| {
+                let n = 10 + (r.next() % 300) as usize;
+                pkt(0, i * 1024, true, &r.bytes(n))
+            })
+            .collect();
+        mux_streams(true, &[a], &packets).unwrap()
+    }
+
+    fn fx_subs_pcm() -> Vec<u8> {
+        let mut r = Lcg(4);
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 16;
+        v.height = 16;
+        let s = Stream::new(1, CodecId::Subrip);
+        let mut a = Stream::new(2, CodecId::Pcm);
+        a.sample_rate = 8_000;
+        a.channels = 1;
+        a.sample_format = Some(SampleFormat::S16);
+        a.time_base = Rational::new(1, 8_000);
+        let mut f = Stream::new(3, CodecId::Pcm);
+        f.sample_rate = 8_000;
+        f.channels = 2;
+        f.sample_format = Some(SampleFormat::F32);
+        let w = Stream::new(4, CodecId::WebVtt);
+        let mut packets = Vec::new();
+        for i in 0..40i64 {
+            packets.push(pkt(0, i * 250, i % 8 == 0, &r.bytes(30)));
+            packets.push(pkt(2, i * 2000, true, &r.bytes(500)));
+            packets.push(pkt(3, i * 250, true, &r.bytes(200)));
+        }
+        for i in 0..6i64 {
+            let mut cue = pkt(
+                1,
+                700 + i * 1500,
+                true,
+                format!("cue number {i}").as_bytes(),
+            );
+            cue.duration = 1000 + i * 10;
+            packets.push(cue);
+            let mut vtt = pkt(4, 900 + i * 1500, true, format!("vtt {i}").as_bytes());
+            vtt.duration = 400;
+            packets.push(vtt);
+        }
+        mux_streams(false, &[v, s, a, f, w], &packets).unwrap()
+    }
+
+    // Tiny EBML writer for hand-built fixtures (the muxer never emits ASS,
+    // unknown sizes, or foreign level-1 elements).
+    fn put_id(out: &mut Vec<u8>, id: u32) {
+        let n = 4 - (id.leading_zeros() / 8) as usize;
+        for i in (0..n).rev() {
+            out.push((id >> (8 * i)) as u8);
+        }
+    }
+    fn elem(out: &mut Vec<u8>, id: u32, body: &[u8]) {
+        put_id(out, id);
+        out.push(0x01); // 8-byte size vint: marker + 7 value bytes
+        out.extend_from_slice(&(body.len() as u64).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+    }
+    /// An unknown-size element header (all-ones 8-byte size).
+    fn open_unknown(out: &mut Vec<u8>, id: u32) {
+        put_id(out, id);
+        out.extend_from_slice(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+    fn uint(out: &mut Vec<u8>, id: u32, v: u64) {
+        elem(out, id, &v.to_be_bytes());
+    }
+    fn block(track: u8, rel: i16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x80 | track];
+        b.extend_from_slice(&rel.to_be_bytes());
+        b.push(flags);
+        b.extend_from_slice(payload);
+        b
+    }
+    fn ebml_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        elem(&mut h, 0x4282, b"matroska");
+        let mut out = Vec::new();
+        elem(&mut out, 0x1A45_DFA3, &h);
+        out
+    }
+    fn track_entry(number: u64, ttype: u64, codec: &str, private: &[u8], extra: &[u8]) -> Vec<u8> {
+        let mut te = Vec::new();
+        uint(&mut te, ID_TRACK_NUMBER, number);
+        uint(&mut te, ID_TRACK_TYPE, ttype);
+        elem(&mut te, ID_CODEC_ID, codec.as_bytes());
+        if !private.is_empty() {
+            elem(&mut te, ID_CODEC_PRIVATE, private);
+        }
+        te.extend_from_slice(extra);
+        let mut out = Vec::new();
+        elem(&mut out, ID_TRACK_ENTRY, &te);
+        out
+    }
+
+    /// ASS track + foreign level-1 elements + BlockGroups in both child
+    /// orders + blocks the demuxer must drop (laced, unknown track).
+    fn fx_ass() -> Vec<u8> {
+        let mut seg = Vec::new();
+        elem(&mut seg, 0x114D_9B74, &[0xEC, 0x81, 0x00]); // SeekHead
+        elem(&mut seg, 0xEC, &[0; 10]); // Void
+        let mut info = Vec::new();
+        uint(&mut info, ID_TIMESTAMP_SCALE, 1_000_000);
+        elem(&mut info, ID_DURATION, &5000.0f64.to_be_bytes());
+        elem(&mut seg, ID_INFO, &info);
+        let mut tracks = track_entry(1, 17, "S_TEXT/ASS", b"[Script Info]\nTitle: x\n", &[]);
+        let mut video = Vec::new();
+        uint(&mut video, ID_PIXEL_WIDTH, 32);
+        uint(&mut video, ID_PIXEL_HEIGHT, 18);
+        let mut vel = Vec::new();
+        elem(&mut vel, ID_VIDEO, &video);
+        tracks.extend(track_entry(2, 1, "V_VP9", &[], &vel));
+        elem(&mut seg, ID_TRACKS, &tracks);
+        elem(&mut seg, 0x1254_C367, b"tags-ignored"); // Tags
+        let mut c1 = Vec::new();
+        uint(&mut c1, ID_TIMESTAMP, 0);
+        let mut g = Vec::new();
+        elem(
+            &mut g,
+            ID_BLOCK,
+            &block(1, 100, 0, b"0,0,Default,,0,0,0,,Hello, world"),
+        );
+        uint(&mut g, ID_BLOCK_DURATION, 900);
+        elem(&mut c1, ID_BLOCK_GROUP, &g);
+        elem(&mut c1, ID_SIMPLE_BLOCK, &block(2, 0, 0x80, &[7; 64]));
+        elem(&mut c1, ID_SIMPLE_BLOCK, &block(2, 40, 0x00, &[8; 33]));
+        elem(&mut seg, ID_CLUSTER, &c1);
+        let mut c2 = Vec::new();
+        uint(&mut c2, ID_TIMESTAMP, 2000);
+        let mut g = Vec::new();
+        uint(&mut g, ID_BLOCK_DURATION, 1500);
+        elem(
+            &mut g,
+            ID_BLOCK,
+            &block(1, -5, 0, b"1,0,Default,,0,0,0,,Second, line"),
+        );
+        elem(&mut c2, ID_BLOCK_GROUP, &g);
+        elem(&mut c2, 0xEC, &[0; 4]); // Void inside a cluster
+        elem(&mut c2, ID_SIMPLE_BLOCK, &block(2, 10, 0x82, &[9; 20])); // laced
+        elem(&mut c2, ID_SIMPLE_BLOCK, &block(9, 10, 0x80, &[9; 20])); // no track
+        elem(&mut c2, 0xBF, &[1, 2, 3, 4]); // CRC-32
+        elem(&mut c2, ID_SIMPLE_BLOCK, &block(2, 80, 0x80, &[10; 50]));
+        elem(&mut seg, ID_CLUSTER, &c2);
+        elem(&mut seg, ID_CUES, b"cues-ignored");
+        let mut file = ebml_header();
+        elem(&mut file, ID_SEGMENT, &seg);
+        file
+    }
+
+    /// Unknown-size Segment, 0.1 ms TimestampScale, H.264 (avcC) + Opus, a
+    /// known-size Cluster then a final unknown-size one trailed by Cues/Tags.
+    fn fx_unknown_tail() -> Vec<u8> {
+        let mut r = Lcg(5);
+        let mut file = ebml_header();
+        open_unknown(&mut file, ID_SEGMENT);
+        let mut info = Vec::new();
+        uint(&mut info, ID_TIMESTAMP_SCALE, 100_000);
+        elem(&mut file, ID_INFO, &info);
+        let sps = [0x67u8, 0x64, 0x00, 0x1F, 0xAC];
+        let pps = [0x68u8, 0xEE, 0x3C];
+        let avcc = rff_format::avc::build_avcc_record(&sps, &pps);
+        let mut tracks = track_entry(1, 1, "V_MPEG4/ISO/AVC", &avcc, &[]);
+        let mut audio = Vec::new();
+        elem(
+            &mut audio,
+            ID_SAMPLING_FREQUENCY,
+            &48_000.0f64.to_be_bytes(),
+        );
+        uint(&mut audio, ID_CHANNELS, 2);
+        let mut ael = Vec::new();
+        elem(&mut ael, ID_AUDIO, &audio);
+        tracks.extend(track_entry(2, 2, "A_OPUS", &opus_head_bytes(), &ael));
+        elem(&mut file, ID_TRACKS, &tracks);
+        let avcc_frame = |r: &mut Lcg, kind: u8, n: usize| {
+            let nal = [&[kind][..], &r.bytes(n)].concat();
+            let mut f = (nal.len() as u32).to_be_bytes().to_vec();
+            f.extend_from_slice(&nal);
+            f
+        };
+        let mut c1 = Vec::new();
+        uint(&mut c1, ID_TIMESTAMP, 0);
+        let f = avcc_frame(&mut r, 0x65, 300);
+        elem(&mut c1, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, &f));
+        elem(&mut c1, ID_SIMPLE_BLOCK, &block(2, 0, 0x80, &r.bytes(80)));
+        let f = avcc_frame(&mut r, 0x41, 120);
+        elem(&mut c1, ID_SIMPLE_BLOCK, &block(1, 400, 0x00, &f));
+        elem(&mut file, ID_CLUSTER, &c1);
+        open_unknown(&mut file, ID_CLUSTER);
+        uint(&mut file, ID_TIMESTAMP, 800);
+        let f = avcc_frame(&mut r, 0x65, 200);
+        elem(&mut file, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, &f));
+        elem(
+            &mut file,
+            ID_SIMPLE_BLOCK,
+            &block(2, 200, 0x80, &r.bytes(90)),
+        );
+        let f = avcc_frame(&mut r, 0x41, 50);
+        elem(&mut file, ID_SIMPLE_BLOCK, &block(1, 400, 0x00, &f));
+        elem(&mut file, ID_CUES, b"cues");
+        elem(&mut file, 0x1254_C367, b"tags");
+        file
+    }
+
+    fn opus_head_bytes() -> Vec<u8> {
+        let mut v = b"OpusHead".to_vec();
+        v.extend_from_slice(&[1, 2, 0, 0]);
+        v.extend_from_slice(&48_000u32.to_le_bytes());
+        v.extend_from_slice(&[0, 0, 0]);
+        v
+    }
+
+    /// The named fixture set: full files plus truncations at fixed distances
+    /// from the end (stable against muxer header-size changes) or fixed
+    /// offsets (hand-built files).
+    fn golden_cases() -> Vec<(String, Vec<u8>)> {
+        let mut cases = vec![
+            ("vp9_opus".to_string(), fx_vp9_opus()),
+            ("h264".to_string(), fx_h264()),
+            ("vorbis".to_string(), fx_vorbis()),
+            ("subs_pcm".to_string(), fx_subs_pcm()),
+            ("ass".to_string(), fx_ass()),
+            ("unknown_tail".to_string(), fx_unknown_tail()),
+        ];
+        let h264 = fx_h264();
+        let subs = fx_subs_pcm();
+        for k in [1usize, 37, 500, 2_000, 9_000] {
+            cases.push((format!("h264-{k}"), h264[..h264.len() - k].to_vec()));
+            cases.push((format!("subs_pcm-{k}"), subs[..subs.len() - k].to_vec()));
+        }
+        for name in ["ass", "unknown_tail"] {
+            let f = if name == "ass" {
+                fx_ass()
+            } else {
+                fx_unknown_tail()
+            };
+            for cut in (7..f.len()).step_by(61) {
+                cases.push((format!("{name}@{cut}"), f[..cut].to_vec()));
+            }
+        }
+        cases
+    }
+
+    /// `(case, packet-line count, fnv of the fingerprint)` recorded from the
+    /// pre-streaming (whole-file buffered) demuxer — except that truncated
+    /// cases cut inside a block now end one packet earlier: a cut-off final
+    /// block is dropped, as matroskadec does (#89).
+    /// The subtitle cues (BlockGroups without a ReferenceBlock) of
+    /// `subs_pcm` and `ass` are keyframes since #110, as in matroskadec;
+    /// they were read as non-keyframes from the Block's (reserved) flag bit.
+    const GOLDENS: &[(&str, usize, u64)] = &[
+        ("vp9_opus", 240, 0x96842ed96f2e9d29),
+        ("h264", 60, 0xbda95d370f6a1c36),
+        ("vorbis", 100, 0x67050340b1055ab7),
+        ("subs_pcm", 132, 0x532373fc2f9794d2),
+        ("ass", 5, 0xbc3d3d1b2ec401b4),
+        ("unknown_tail", 6, 0xc411396fdf4e6dd7),
+        ("h264-1", 60, 0xbda95d370f6a1c36),
+        ("subs_pcm-1", 132, 0x532373fc2f9794d2),
+        ("h264-37", 60, 0xbda95d370f6a1c36),
+        ("subs_pcm-37", 132, 0x532373fc2f9794d2),
+        ("h264-500", 57, 0x944197e69bcc220c),
+        ("subs_pcm-500", 130, 0x24696c5276f8986d),
+        ("h264-2000", 52, 0x0db854153e912db1),
+        ("subs_pcm-2000", 124, 0xa27e3647b5ea09ba),
+        ("h264-9000", 25, 0x3d86012f2d1caf9b),
+        ("subs_pcm-9000", 95, 0x3b6f23427d9c023e),
+        ("ass@7", 0, 0xb88f458891534654),
+        ("ass@68", 0, 0xb88f458891534654),
+        ("ass@129", 0, 0xb88f458891534654),
+        ("ass@190", 0, 0x9db95c26a859bb7a),
+        ("ass@251", 0, 0x4ebbedf20cdfd5d0),
+        ("ass@312", 0, 0x7602000005937fb4),
+        ("ass@373", 0, 0x372ea377fd90c6a2),
+        ("ass@434", 0, 0x372ea377fd90c6a2),
+        ("ass@495", 1, 0xfcd68ba713f030b6),
+        ("ass@556", 2, 0x473268b97c254ad2),
+        ("ass@617", 3, 0xe5188e9f2efc314c),
+        ("ass@678", 3, 0xe5188e9f2efc314c),
+        ("ass@739", 4, 0xae692cd404adfdff),
+        ("ass@800", 4, 0xae692cd404adfdff),
+        ("unknown_tail@7", 0, 0xb88f458891534654),
+        ("unknown_tail@68", 0, 0xb88f458891534654),
+        ("unknown_tail@129", 0, 0x19e5d80fc8c27d2f),
+        ("unknown_tail@190", 0, 0xe16a82a06e5f72c7),
+        ("unknown_tail@251", 0, 0x794321a15a45a76a),
+        ("unknown_tail@312", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@373", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@434", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@495", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@556", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@617", 0, 0x1a3e72b070089f79),
+        ("unknown_tail@678", 1, 0xe9af22a16a8307bd),
+        ("unknown_tail@739", 1, 0xe9af22a16a8307bd),
+        ("unknown_tail@800", 2, 0x769b56f7dc4d42ae),
+        ("unknown_tail@861", 2, 0x769b56f7dc4d42ae),
+        ("unknown_tail@922", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@983", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1044", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1105", 3, 0xb0138b7ec7bd1d1f),
+        ("unknown_tail@1166", 4, 0x86f6fb2e149851b4),
+        ("unknown_tail@1227", 4, 0x86f6fb2e149851b4),
+        ("unknown_tail@1288", 5, 0xf6378f88235849f0),
+    ];
+
+    #[test]
+    fn streaming_matches_buffered_goldens() {
+        let mut missing = String::new();
+        for (name, file) in golden_cases() {
+            let fp = fingerprint(file);
+            let n = fp.lines().filter(|l| l.starts_with('P')).count();
+            let h = fnv(fp.as_bytes());
+            match GOLDENS.iter().find(|g| g.0 == name) {
+                Some(&(_, gn, gh)) => assert_eq!((n, h), (gn, gh), "{name}:\n{fp}"),
+                None => missing.push_str(&format!("    (\"{name}\", {n}, 0x{h:016x}),\n")),
+            }
+        }
+        assert!(missing.is_empty(), "missing goldens:\n{missing}");
+    }
+
+    /// Counts the bytes the demuxer pulls from its input.
+    struct Counting<R> {
+        inner: R,
+        read: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_header_reads_only_a_prefix() {
+        use std::sync::atomic::Ordering;
+        let mut r = Lcg(9);
+        let mut v = Stream::new(0, CodecId::Vp9);
+        v.width = 640;
+        v.height = 360;
+        let packets: Vec<Packet> = (0..200i64)
+            .map(|i| pkt(0, i * 40, i % 50 == 0, &r.bytes(20_000)))
+            .collect();
+        let file = mux_streams(false, &[v], &packets).unwrap();
+        assert!(file.len() > 4_000_000);
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input = Counting {
+            inner: Cursor::new(file.clone()),
+            read: read.clone(),
+        };
+        let mut dem = MkvDemuxer::new(Box::new(input));
+        let streams = dem.read_header().unwrap();
+        assert_eq!((streams[0].width, streams[0].height), (640, 360));
+        assert_eq!(streams[0].nb_frames, None); // not knowable without the payload
+        let after_header = read.load(Ordering::Relaxed);
+        assert!(
+            after_header <= READ_BUF as u64,
+            "read_header pulled {after_header} of {} bytes",
+            file.len()
+        );
+        // Streaming: each packet costs about one block of read-ahead.
+        let p = dem.read_packet().unwrap();
+        assert_eq!(p.data, packets[0].data);
+        assert!(read.load(Ordering::Relaxed) <= 2 * READ_BUF as u64);
+        let mut n = 1;
+        while let Ok(p) = dem.read_packet() {
+            assert_eq!(p.data, packets[n].data);
+            n += 1;
+        }
+        assert_eq!(n, 200);
+        assert_eq!(read.load(Ordering::Relaxed), file.len() as u64);
+    }
+
+    /// The H.264 + Opus tracks of [`fx_unknown_tail`], with no Clusters yet.
+    fn unknown_segment_prefix() -> Vec<u8> {
+        let mut f = fx_unknown_tail();
+        let mut cluster = Vec::new();
+        put_id(&mut cluster, ID_CLUSTER);
+        let at = f
+            .windows(4)
+            .position(|w| w == &cluster[..])
+            .expect("fixture has a cluster");
+        f.truncate(at);
+        f
+    }
+
+    #[test]
+    fn unknown_size_clusters_end_at_level1_elements() {
+        let mut f = unknown_segment_prefix();
+        // Unknown-size cluster, a Void at segment level is impossible to tell
+        // from a cluster child, so use Tags (level 1) to end the first one.
+        open_unknown(&mut f, ID_CLUSTER);
+        uint(&mut f, ID_TIMESTAMP, 100);
+        elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 0, 0x80, b"a0"));
+        elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 5, 0x80, b"a1"));
+        elem(&mut f, ID_TAGS, b"tags between clusters");
+        // A second unknown-size cluster ended directly by a third (known).
+        open_unknown(&mut f, ID_CLUSTER);
+        uint(&mut f, ID_TIMESTAMP, 200);
+        elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 1, 0x80, b"b0"));
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 300);
+        elem(&mut c, ID_SIMPLE_BLOCK, &block(2, 2, 0x80, b"c0"));
+        elem(&mut f, ID_CLUSTER, &c);
+        // Unknown-size again, running to EOF (the Segment is unknown-size).
+        open_unknown(&mut f, ID_CLUSTER);
+        uint(&mut f, ID_TIMESTAMP, 400);
+        elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 3, 0x80, b"d0"));
+
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(f)));
+        let streams = dem.read_header().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[1].time_base, Rational::new(1, 10_000));
+        let mut got = Vec::new();
+        loop {
+            match dem.read_packet() {
+                Ok(p) => got.push((p.stream_index, p.pts.unwrap(), p.data)),
+                Err(Error::Eof) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let want: Vec<(usize, i64, Vec<u8>)> = [
+            (100, "a0"),
+            (105, "a1"),
+            (201, "b0"),
+            (302, "c0"),
+            (403, "d0"),
+        ]
+        .iter()
+        .map(|&(pts, d)| (1, pts, d.as_bytes().to_vec()))
+        .collect();
+        assert_eq!(got, want);
+        assert!(matches!(dem.read_packet(), Err(Error::Eof))); // stays at EOF
+    }
+
+    #[test]
+    fn known_size_segment_ignores_trailing_bytes() {
+        let mut file = fx_ass();
+        let packets = fingerprint(file.clone());
+        // A second Segment (and junk) after the first one's end is not read.
+        let mut extra = Vec::new();
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 0);
+        elem(&mut c, ID_SIMPLE_BLOCK, &block(2, 0, 0x80, b"after"));
+        elem(&mut extra, ID_CLUSTER, &c);
+        elem(&mut file, ID_SEGMENT, &extra);
+        file.extend_from_slice(&[0xA3, 0x85, 1, 2, 3]);
+        assert_eq!(fingerprint(file), packets);
+    }
+
+    #[test]
+    fn oversized_declarations_do_not_allocate_or_hang() {
+        // Tracks declaring 1 GiB (past the header cap) is skipped: no tracks.
+        let mut f = ebml_header();
+        open_unknown(&mut f, ID_SEGMENT);
+        put_id(&mut f, ID_TRACKS);
+        f.extend_from_slice(&[0x01, 0, 0, 0, 0x40, 0, 0, 0]);
+        f.extend_from_slice(&track_entry(1, 1, "V_VP9", &[], &[]));
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(f)));
+        let err = dem.read_header().unwrap_err();
+        assert!(err.to_string().contains("no tracks"), "{err}");
+        assert!(dem.read_header().is_err()); // and stays failed
+
+        // A SimpleBlock declaring ~2^55 bytes, or a Timestamp declaring 2^40,
+        // over a few real bytes: each is streamed past (no buffer of the
+        // declared size) and the walk ends at EOF, quickly.
+        for (id, size) in [
+            (ID_SIMPLE_BLOCK, [0x01, 0x7F, 0, 0, 0, 0, 0, 0]),
+            (ID_TIMESTAMP, [0x01, 0, 0x01, 0, 0, 0, 0, 0]),
+        ] {
+            let mut f = unknown_segment_prefix();
+            open_unknown(&mut f, ID_CLUSTER);
+            elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 0, 0x80, b"ok"));
+            put_id(&mut f, id);
+            f.extend_from_slice(&size);
+            f.extend_from_slice(&block(2, 0, 0x80, &[1; 100]));
+            elem(&mut f, ID_SIMPLE_BLOCK, &block(2, 1, 0x80, b"unreachable"));
+            let fp = fingerprint(f);
+            assert_eq!(fp.lines().filter(|l| l.starts_with('P')).count(), 1, "{fp}");
+        }
+    }
+
+    #[test]
+    fn truncated_and_garbage_inputs_terminate_without_panicking() {
+        let bounded = |file: Vec<u8>| {
+            let len = file.len();
+            let fp = fingerprint(file);
+            let n = fp.lines().filter(|l| l.starts_with('P')).count();
+            assert!(n <= len, "{n} packets from {len} bytes");
+        };
+        // Every prefix of the hand-built files, a stride through a muxed one.
+        for f in [fx_ass(), fx_unknown_tail()] {
+            for cut in 0..=f.len() {
+                bounded(f[..cut].to_vec());
+            }
+        }
+        let subs = fx_subs_pcm();
+        for cut in (0..subs.len()).step_by(97) {
+            bounded(subs[..cut].to_vec());
+        }
+        // Byte flips through valid files.
+        let mut r = Lcg(77);
+        for base in [fx_ass(), fx_unknown_tail(), fx_h264()] {
+            for _ in 0..300 {
+                let mut f = base.clone();
+                for _ in 0..1 + r.next() % 4 {
+                    let at = (r.next() as usize) % f.len();
+                    f[at] = r.next() as u8;
+                }
+                bounded(f);
+            }
+        }
+        // Pure garbage, bare and behind an EBML header + unknown Segment.
+        for i in 0..300usize {
+            let mut g = r.bytes(i * 7 % 2000);
+            for b in g.iter_mut().step_by(3) {
+                *b = r.next() as u8; // let zero bytes in too
+            }
+            bounded(g.clone());
+            let mut f = ebml_header();
+            open_unknown(&mut f, ID_SEGMENT);
+            f.extend_from_slice(&g);
+            bounded(f);
+            let mut f = unknown_segment_prefix();
+            open_unknown(&mut f, ID_CLUSTER);
+            f.extend_from_slice(&g);
+            bounded(f);
+        }
+    }
+
+    #[test]
+    fn signed_ints_sign_extend() {
+        let mut e = Ebml::new(&[0x7F, 0xFF, 0x8C, 0xD2, 0xE1, 0x00, 0x8C, 0xD2, 0xE1]);
+        assert_eq!(e.read_int(1), 127);
+        assert_eq!(e.read_int(1), -1);
+        assert_eq!(e.read_int(3), -7_548_191); // 0x8CD2E1 has the sign bit set
+        assert_eq!(e.read_int(4), 9_229_025); // ...so writers lead with 0x00
+        assert_eq!(Ebml::new(&[]).read_int(0), 0);
+    }
+
+    /// A 44.1 kHz audio track whose BlockGroups carry DiscardPadding (signed
+    /// ns) before and after the Block.
+    fn fx_discard_padding() -> Vec<u8> {
+        let mut seg = Vec::new();
+        let mut audio = Vec::new();
+        elem(
+            &mut audio,
+            ID_SAMPLING_FREQUENCY,
+            &44_100.0f64.to_be_bytes(),
+        );
+        uint(&mut audio, ID_CHANNELS, 2);
+        let mut ael = Vec::new();
+        elem(&mut ael, ID_AUDIO, &audio);
+        elem(
+            &mut seg,
+            ID_TRACKS,
+            &track_entry(1, 2, "A_VORBIS", &[], &ael),
+        );
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 0);
+        elem(&mut c, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, b"a"));
+        // 407 samples at 44.1 kHz as FFmpeg's muxer writes it: 9,229,025 ns.
+        let mut g = Vec::new();
+        elem(&mut g, ID_DISCARD_PADDING, &9_229_025i64.to_be_bytes()[4..]);
+        elem(&mut g, ID_BLOCK, &block(1, 23, 0, b"b"));
+        elem(&mut c, ID_BLOCK_GROUP, &g);
+        // Negative padding (FFmpeg's decoder ignores it), Block first.
+        let mut g = Vec::new();
+        elem(&mut g, ID_BLOCK, &block(1, 46, 0, b"c"));
+        elem(
+            &mut g,
+            ID_DISCARD_PADDING,
+            &(-5_000_000i64).to_be_bytes()[5..],
+        );
+        elem(&mut c, ID_BLOCK_GROUP, &g);
+        elem(&mut seg, ID_CLUSTER, &c);
+        let mut file = ebml_header();
+        elem(&mut file, ID_SEGMENT, &seg);
+        file
+    }
+
+    fn demux_all(file: Vec<u8>) -> (Vec<Stream>, Vec<Packet>) {
+        let mut dem = MkvDemuxer::new(Box::new(Cursor::new(file)));
+        let streams = dem.read_header().unwrap();
+        let mut packets = Vec::new();
+        while let Ok(p) = dem.read_packet() {
+            packets.push(p);
+        }
+        (streams, packets)
+    }
+
+    #[test]
+    fn discard_padding_becomes_samples_at_the_track_rate() {
+        let (_, packets) = demux_all(fx_discard_padding());
+        let got: Vec<_> = packets
+            .iter()
+            .map(|p| (p.data.clone(), p.pts, p.discard_padding))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), Some(0), 0),
+                (b"b".to_vec(), Some(23), 407),
+                (b"c".to_vec(), Some(46), 0),
+            ]
+        );
+        assert_eq!(discard_samples(6_500_000, 48_000), 312); // Opus pre-skip size
+        assert_eq!(discard_samples(1, 48_000), 0);
+        assert_eq!(discard_samples(10_417, 48_000), 1); // rounds to nearest
+        assert_eq!(discard_samples(1_000_000_000, 0), 0); // no rate: no samples
+        assert_eq!(discard_samples(i64::MAX, 384_000), u32::MAX);
+    }
+
+    /// The muxer writes a packet's padding back as DiscardPadding (in a
+    /// BlockGroup, as FFmpeg does) and the demuxer recovers the same count,
+    /// so `-c copy` between Matroska files keeps the trim.
+    #[test]
+    fn discard_padding_survives_mux_demux() {
+        let mut a = Stream::new(0, CodecId::Opus);
+        a.sample_rate = 48_000;
+        a.channels = 2;
+        a.time_base = Rational::new(1, 48_000);
+        let mut packets = vec![pkt(0, 0, true, &[1; 30]), pkt(0, 960, true, &[2; 31])];
+        packets.push(pkt(0, 1920, true, &[3; 32]));
+        packets[2].discard_padding = 648;
+        for webm in [false, true] {
+            let file = mux_streams(webm, &[a.clone()], &packets).unwrap();
+            let (_, got) = demux_all(file);
+            let got: Vec<_> = got
+                .iter()
+                .map(|p| (p.data.clone(), p.discard_padding))
+                .collect();
+            assert_eq!(
+                got,
+                vec![(vec![1; 30], 0), (vec![2; 31], 0), (vec![3; 32], 648)]
+            );
+        }
+        // 44.1 kHz: 9,229,025 ns, whose top bit forces a leading zero byte.
+        a.sample_rate = 44_100;
+        a.time_base = Rational::new(1, 44_100);
+        packets[2].discard_padding = 407;
+        let (_, got) = demux_all(mux_streams(false, &[a], &packets).unwrap());
+        assert_eq!(got[2].discard_padding, 407);
+    }
+
+    /// One video track (`track_extra` appended to its TrackEntry, after a
+    /// 320x240 Video element) at `scale` ns per tick, and one Cluster of
+    /// `blocks` (already-built Cluster children) at timestamp 0.
+    fn fx_video_track(
+        scale: u64,
+        video_extra: &[u8],
+        track_extra: &[u8],
+        blocks: &[u8],
+    ) -> Vec<u8> {
+        let mut seg = Vec::new();
+        let mut info = Vec::new();
+        uint(&mut info, ID_TIMESTAMP_SCALE, scale);
+        elem(&mut seg, ID_INFO, &info);
+        let mut video = Vec::new();
+        uint(&mut video, ID_PIXEL_WIDTH, 320);
+        uint(&mut video, ID_PIXEL_HEIGHT, 240);
+        video.extend_from_slice(video_extra);
+        let mut extra = Vec::new();
+        elem(&mut extra, ID_VIDEO, &video);
+        extra.extend_from_slice(track_extra);
+        elem(
+            &mut seg,
+            ID_TRACKS,
+            &track_entry(1, 1, "V_VP9", &[], &extra),
+        );
+        let mut c = Vec::new();
+        uint(&mut c, ID_TIMESTAMP, 0);
+        c.extend_from_slice(blocks);
+        elem(&mut seg, ID_CLUSTER, &c);
+        let mut file = ebml_header();
+        elem(&mut file, ID_SEGMENT, &seg);
+        file
+    }
+
+    /// #86: blocks without a BlockDuration last the track's DefaultDuration
+    /// (in Segment ticks, truncated); a BlockDuration, when present, wins.
+    #[test]
+    fn default_duration_fills_packet_durations() {
+        let mut blocks = Vec::new();
+        elem(&mut blocks, ID_SIMPLE_BLOCK, &block(1, 0, 0x80, b"k"));
+        elem(&mut blocks, ID_SIMPLE_BLOCK, &block(1, 40, 0x00, b"p"));
+        let mut g = Vec::new();
+        elem(&mut g, ID_BLOCK, &block(1, 80, 0, b"g"));
+        uint(&mut g, ID_BLOCK_DURATION, 7);
+        elem(&mut blocks, ID_BLOCK_GROUP, &g);
+        let mut g = Vec::new(); // a BlockGroup with no BlockDuration
+        elem(&mut g, ID_BLOCK, &block(1, 120, 0, b"h"));
+        elem(&mut blocks, ID_BLOCK_GROUP, &g);
+        let durations =
+            |file: Vec<u8>| -> Vec<i64> { demux_all(file).1.iter().map(|p| p.duration).collect() };
+
+        // 25 fps at the default 1 ms tick.
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 40_000_000);
+        let f = fx_video_track(1_000_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![40, 40, 7, 40]);
+
+        // 29.97 fps (33,366,667 ns) truncates to 33 ticks of 1 ms, and to
+        // 333 ticks of 0.1 ms (the block timestamps are just ticks too).
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 33_366_667);
+        let f = fx_video_track(1_000_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![33, 33, 7, 33]);
+        let f = fx_video_track(100_000, &[], &dd, &blocks);
+        assert_eq!(durations(f), vec![333, 333, 7, 333]);
+
+        // No DefaultDuration: the (deprecated) Video FrameRate stands in for
+        // it, as in matroskadec; with neither, durations stay unknown.
+        let mut fr = Vec::new();
+        elem(&mut fr, ID_FRAME_RATE, &25.0f64.to_be_bytes());
+        let f = fx_video_track(1_000_000, &fr, &[], &blocks);
+        assert_eq!(durations(f), vec![40, 40, 7, 40]);
+        let f = fx_video_track(1_000_000, &[], &[], &blocks);
+        assert_eq!(durations(f), vec![0, 0, 7, 0]);
+    }
+
+    /// #86 end to end: a 25 fps track relying on DefaultDuration, copied
+    /// through the muxer, keeps its full length (the Segment Duration is the
+    /// last frame's end, 8,000 ms, not its start, 7,960 ms).
+    #[test]
+    fn default_duration_survives_a_copy_remux() {
+        let mut blocks = Vec::new();
+        for i in 0..200i16 {
+            let key = if i % 50 == 0 { 0x80 } else { 0x00 };
+            elem(
+                &mut blocks,
+                ID_SIMPLE_BLOCK,
+                &block(1, i * 40, key, &[i as u8 | 1; 9]),
+            );
+        }
+        let mut dd = Vec::new();
+        uint(&mut dd, ID_DEFAULT_DURATION, 40_000_000);
+        let (streams, packets) = demux_all(fx_video_track(1_000_000, &[], &dd, &blocks));
+        assert_eq!(packets.len(), 200);
+        assert!(packets.iter().all(|p| p.duration == 40));
+        let copy = mux_streams(false, &streams, &packets).unwrap();
+        let (streams, _) = demux_all(copy);
+        assert_eq!(streams[0].duration, Some(8_000));
+    }
+
+    /// #89: a file cut inside its last (Simple)Block or BlockGroup yields
+    /// only the complete blocks before it, as matroskadec does — the cut-off
+    /// frame is never handed to a decoder (a Vorbis decoder would turn it
+    /// into one extra block of audio).
+    #[test]
+    fn truncated_final_block_is_dropped() {
+        let file = fx_vorbis();
+        let (_, full) = demux_all(file.clone());
+        assert_eq!(full.len(), 100);
+        let last = full.last().unwrap().data.clone();
+        let at = file
+            .windows(last.len())
+            .rposition(|w| w == &last[..])
+            .expect("last payload in the file");
+        // Cut anywhere inside the last block's payload (or right after its
+        // header): 99 whole packets, never a partial 100th.
+        for cut in [at, at + 1, at + last.len() / 2, at + last.len() - 1] {
+            let (_, got) = demux_all(file[..cut].to_vec());
+            assert_eq!(got.len(), 99, "cut at {cut}");
+            for (g, f) in got.iter().zip(&full) {
+                assert_eq!(g.data, f.data, "cut at {cut}");
+            }
+        }
+        // Intact up to the last byte: all 100.
+        assert_eq!(demux_all(file[..at + last.len()].to_vec()).1.len(), 100);
+
+        // A BlockGroup whose Block is complete but whose DiscardPadding was
+        // cut off is dropped too (matroskadec fails the whole group).
+        let f = fx_discard_padding();
+        let pad = (-5_000_000i64).to_be_bytes();
+        let at = f
+            .windows(3)
+            .position(|w| w == &pad[5..])
+            .expect("padding in the fixture");
+        let data = |file: &[u8]| -> Vec<Vec<u8>> {
+            demux_all(file.to_vec())
+                .1
+                .into_iter()
+                .map(|p| p.data)
+                .collect()
+        };
+        // "c"'s Block precedes the cut; its group is incomplete all the same.
+        assert_eq!(data(&f[..at + 1]), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(data(&f).len(), 3);
+    }
+}

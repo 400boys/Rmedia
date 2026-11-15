@@ -1,0 +1,19 @@
+[package]
+name = "rff-format-mkv"
+description = "Remade FFmpeg (Rust): Matroska / WebM demuxer (EBML)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["matroska", "mkv", "webm", "container", "demuxer"]
+categories = ["multimedia", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
+rff-subtitle.workspace = true
+miniz_oxide.workspace = true

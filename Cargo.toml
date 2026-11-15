@@ -1,58 +1,270 @@
 [workspace]
-resolver = "3"
-members = [
-    "crates/rmedia-util",
-    "crates/rmedia-codec",
-    "crates/rmedia-swscale",
-    "crates/rmedia-swresample",
-    "crates/rmedia-format",
-    "crates/rmedia-filter",
-    "crates/rmedia-device",
-    "crates/rmedia-tools",
-    "crates/rmedia",
+resolver = "2"
+members = ["crates/*"]
+
+# `cargo build` (no args) builds the whole engine + CLI + server, but NOT the
+# Dioxus UI â€” that one pulls a heavy webview toolchain, so build it on demand
+# with `cargo build -p rff-ui`.
+default-members = [
+    "crates/rff-core",
+    "crates/rff-codec",
+    "crates/rff-format",
+    "crates/rff-codec-h264",
+    "crates/rff-codec-hevc",
+    "crates/rff-codec-opus",
+    "crates/rff-codec-avif",
+    "crates/rff-format-avi",
+    "crates/rff-format-avif",
+    "crates/rff-codec-png",
+    "crates/rff-format-png",
+    "crates/rff-codec-jpeg",
+    "crates/rff-format-jpeg",
+    "crates/rff-codec-gif",
+    "crates/rff-format-gif",
+    "crates/rff-codec-webp",
+    "crates/rff-format-webp",
+    "crates/rff-codec-pcm",
+    "crates/rff-codec-vorbis",
+    "crates/rff-codec-flac",
+    "crates/rff-codec-jxl",
+    "crates/rff-codec-aac",
+    "crates/rff-codec-vp9",
+    "crates/rff-codec-av2",
+    "crates/rff-codec-mp3",
+    "crates/rusty_vp9",
+    "crates/rusty_h265",
+    "crates/rusty_h265-accel",
+    "crates/rusty_flac",
+    "crates/rusty_mp3",
+    "crates/rusty_aac",
+    "crates/rusty_vorbis",
+    "crates/rusty_png",
+    "crates/rff-codec-rawvideo",
+    "crates/rff-format-wav",
+    "crates/rff-format-y4m",
+    "crates/rff-format-ivf",
+    "crates/rff-format-av2f",
+    "crates/rff-format-ogg",
+    "crates/rff-format-flac",
+    "crates/rff-format-mp3",
+    "crates/rff-format-jxl",
+    "crates/rff-format-mp4",
+    "crates/rff-format-mkv",
+    "crates/rff-format-ts",
+    "crates/rff-format-flv",
+    "crates/rff-format-hls",
+    "crates/rff-format-mjpeg",
+    "crates/rff-format-rtp",
+    "crates/rff-io",
+    "crates/rff-subtitle",
+    "crates/rff-format-srt",
+    "crates/rff-format-ass",
+    "crates/rff-format-webvtt",
+    "crates/rff-filter",
+    "crates/rff-resample",
+    "crates/rff-targets",
+    "crates/rff",
+    "crates/rff-cli",
+    "crates/rff-auth",
+    "crates/rff-server",
 ]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2024"
-authors = ["Rmedia Developers"]
-license = "LGPL-2.1-or-later OR GPL-2.0-or-later"
-repository = "https://github.com/rmedia/rmedia"
-homepage = "https://rmedia.org"
-readme = "README.md"
-description = "100% Pure Rust multimedia framework reproducing FFmpeg"
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-unused_imports = "allow"
-unused_variables = "allow"
-dead_code = "allow"
-unused_mut = "allow"
-
-[workspace.lints.clippy]
-too_many_arguments = "allow"
-needless_range_loop = "allow"
-manual_swap = "allow"
-chunks_exact_to_as_chunks = "allow"
-manual_is_multiple_of = "allow"
-manual_div_ceil = "allow"
-field_reassign_with_default = "allow"
-suspicious_arithmetic_impl = "allow"
-manual_flatten = "allow"
-inconsistent_digit_grouping = "allow"
-collapsible_if = "allow"
-if_same_then_else = "allow"
-manual_range_contains = "allow"
-derivable_impls = "allow"
-unnecessary_min_or_max = "allow"
+version = "0.5.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+authors = ["Mata Network <https://www.mata.network>"]
+rust-version = "1.85"
 
 [workspace.dependencies]
-rmedia-util = { path = "crates/rmedia-util" }
-rmedia-codec = { path = "crates/rmedia-codec" }
-rmedia-swscale = { path = "crates/rmedia-swscale" }
-rmedia-swresample = { path = "crates/rmedia-swresample" }
-rmedia-format = { path = "crates/rmedia-format" }
-rmedia-filter = { path = "crates/rmedia-filter" }
-rmedia-device = { path = "crates/rmedia-device" }
-rmedia-tools = { path = "crates/rmedia-tools" }
-rmedia = { path = "crates/rmedia" }
+# Internal crates (path-linked; versions track the workspace).
+rff-core = { path = "crates/rff-core", version = "0.5.0" }
+rff-codec = { path = "crates/rff-codec", version = "0.5.0" }
+rff-format = { path = "crates/rff-format", version = "0.5.0" }
+rff-targets = { path = "crates/rff-targets", version = "0.2.17" }
+rff-codec-h264 = { path = "crates/rff-codec-h264", version = "0.3.13" }
+rff-codec-hevc = { path = "crates/rff-codec-hevc", version = "0.2.14" }
+rff-codec-opus = { path = "crates/rff-codec-opus", version = "0.3.13" }
+rff-codec-avif = { path = "crates/rff-codec-avif", version = "0.5.0" }
+rff-format-avi = { path = "crates/rff-format-avi", version = "0.5.0" }
+rff-format-avif = { path = "crates/rff-format-avif", version = "0.5.0" }
+rff-codec-png = { path = "crates/rff-codec-png", version = "0.5.0" }
+rff-format-png = { path = "crates/rff-format-png", version = "0.5.0" }
+rff-codec-jpeg = { path = "crates/rff-codec-jpeg", version = "0.5.0" }
+rff-format-jpeg = { path = "crates/rff-format-jpeg", version = "0.5.0" }
+rff-codec-gif = { path = "crates/rff-codec-gif", version = "0.5.0" }
+rff-format-gif = { path = "crates/rff-format-gif", version = "0.5.0" }
+rff-codec-webp = { path = "crates/rff-codec-webp", version = "0.2.14" }
+rff-format-webp = { path = "crates/rff-format-webp", version = "0.2.14" }
+rff-codec-pcm = { path = "crates/rff-codec-pcm", version = "0.5.0" }
+rff-codec-vorbis = { path = "crates/rff-codec-vorbis", version = "0.5.0" }
+rff-codec-flac = { path = "crates/rff-codec-flac", version = "0.5.0" }
+rff-codec-jxl = { path = "crates/rff-codec-jxl", version = "0.5.0" }
+rff-codec-aac = { path = "crates/rff-codec-aac", version = "1.1.14" }
+rff-codec-vp9 = { path = "crates/rff-codec-vp9", version = "0.5.0" }
+rff-codec-av2 = { path = "crates/rff-codec-av2", version = "0.5.0" }
+rff-codec-mp3 = { path = "crates/rff-codec-mp3", version = "1.0.14" }
+# Standalone, publishable codec cores (the `rusty_h264` pattern: pure codec
+# crate + thin rff-codec-* adapter). Each carries its OWN version â€” they ship
+# to crates.io on their own cadence, decoupled from the workspace version and
+# from each other, so these no longer move in lockstep at 0.1.x.
+rusty_vp9 = { path = "crates/rusty_vp9", version = "0.2.1" }
+rusty_h265 = { path = "crates/rusty_h265", version = "0.7.1" }
+rusty_h265-accel = { path = "crates/rusty_h265-accel", version = "0.7.1", default-features = false }
+rusty_flac = { path = "crates/rusty_flac", version = "0.2.2" }
+rusty_mp3 = { path = "crates/rusty_mp3", version = "1.0.6" }
+rusty_aac = { path = "crates/rusty_aac", version = "2.0.2" }
+rusty_vorbis = { path = "crates/rusty_vorbis", version = "0.1.3" }
+# jpeg: our own rusty_jpeg, from crates.io (the vendored copy is gone: one
+# repository publishes it — github.com/Remade-With-Rust/rusty_jpeg).
+rusty_jpeg = "0.4"
+rff-codec-rawvideo = { path = "crates/rff-codec-rawvideo", version = "0.5.0" }
+# TEMPORARY C/FFI H.264 â€” deliberately NOT in default-members; opt-in only.
+rff-codec-openh264 = { path = "crates/rff-codec-openh264", version = "0.5.0" }
+rff-format-wav = { path = "crates/rff-format-wav", version = "0.5.0" }
+rff-format-ogg = { path = "crates/rff-format-ogg", version = "0.5.0" }
+rff-format-flac = { path = "crates/rff-format-flac", version = "0.5.0" }
+rff-format-mp3 = { path = "crates/rff-format-mp3", version = "0.5.0" }
+rff-format-y4m = { path = "crates/rff-format-y4m", version = "0.5.0" }
+rff-format-ivf = { path = "crates/rff-format-ivf", version = "0.5.0" }
+rff-format-av2f = { path = "crates/rff-format-av2f", version = "0.5.0" }
+rff-format-jxl = { path = "crates/rff-format-jxl", version = "0.5.0" }
+rff-format-mp4 = { path = "crates/rff-format-mp4", version = "0.5.0" }
+rff-format-mkv = { path = "crates/rff-format-mkv", version = "0.5.0" }
+rff-format-ts = { path = "crates/rff-format-ts", version = "0.5.0" }
+rff-format-flv = { path = "crates/rff-format-flv", version = "0.5.0" }
+rff-format-hls = { path = "crates/rff-format-hls", version = "0.5.0" }
+rff-format-mjpeg = { path = "crates/rff-format-mjpeg", version = "0.5.0" }
+rff-format-rtp = { path = "crates/rff-format-rtp", version = "0.5.0" }
+rff-io = { path = "crates/rff-io", version = "0.5.0" }
+rff-subtitle = { path = "crates/rff-subtitle", version = "0.5.0" }
+rff-format-srt = { path = "crates/rff-format-srt", version = "0.5.0" }
+rff-format-ass = { path = "crates/rff-format-ass", version = "0.5.0" }
+rff-format-webvtt = { path = "crates/rff-format-webvtt", version = "0.5.0" }
+rff-filter = { path = "crates/rff-filter", version = "0.5.0" }
+rff-resample = { path = "crates/rff-resample", version = "0.5.0" }
+rff = { path = "crates/rff", version = "0.5.0", package = "remade-ffmpeg" }
+rff-auth = { path = "crates/rff-auth", version = "0.5.0" }
+
+# Third-party (all permissive â€” MIT/Apache-2.0; CI-enforced by cargo-deny).
+# AV1 encode + decode come from our own rusty-av1-toolkit (BSD-2-Clause forks of
+# rav1e / rav1d), now published on crates.io AS `rusty_av1e` / `rusty_av1d`
+# (the packages were renamed for publication â€” upstream owns the rav1e/rav1d
+# names â€” so no `package =` alias is needed anymore). This removed rff's last
+# git dependencies: the whole tree is registry-resolvable. The workspace entry
+# stays `default-features = false` so wasm32 builds get the no-asm/no-threading
+# base; rff-codec-avif re-adds `asm` + `threading` for non-wasm targets (nasm
+# is installed locally and on all three CI legs via the h264-asm setup step).
+# The registry versions are toolkit MAIN (the merged no-asm fix + the
+# prom_av1e content-dispatch tier), ahead of the old b471be0 branch pin.
+rusty_av1e = { version = "0.8.0", default-features = false }
+rusty_av1d = { version = "1.2.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+# png: our own rusty_png â€” a performance fork of image-rs/image-png 0.17.16
+# (MIT/Apache-2.0), carried forward in-tree. DEFLATE via miniz_oxide/fdeflate,
+# with an opt-in pure-Rust `zlib-rs` backend. See crates/rusty_png/NOTICE.md.
+rusty_png = { path = "crates/rusty_png", version = "0.3.2", features = ["parallel"] }
+# zlib inflate for Matroska ContentCompression (rff-format-mkv); the same
+# miniz_oxide release rusty_png already pulls in.
+miniz_oxide = "0.8.9"
+# gif: our own rusty_gif — a performance fork of image-rs/image-gif 0.14.2
+# with the NeuQuant quantizer (color_quant 1.1.0) vendored in-tree. Kept under
+# the `gif` dependency name so rff-side imports are unchanged. See
+# crates/rusty_gif/NOTICE.md for attribution.
+gif = { path = "crates/rusty_gif", version = "0.1.0", package = "rusty_gif" }
+# webp: our own rusty_webp â€” a fork of image-rs/image-webp 0.2.4 (MIT/Apache),
+# carried forward in-tree. See crates/rusty_webp/NOTICE.md.
+rusty_webp = { path = "crates/rusty_webp", version = "0.2.1" }
+# Opus comes from our own rusty-opus (BSD-3-Clause fork of the pure-Rust opus-rs
+# port of libopus 1.6 â€” no FFI). The fork's package is now named `rusty-opus`
+# (previously carried upstream's `opus-rs` name â€” renamed so the crate, Cargo.lock,
+# and every benchmark read as `rusty-opus`, not the old baseline label). The dep key
+# stays `rusty_opus` so the rff-side imports are unchanged. Our fork adds byte-identical
+# AVX2 SILK kernels (~+30% vs the pre-fork scalar baseline) + AVX2 decode kernels
+# (resampler FIR, CELT comb filter) + frame-parallel encoding (~3Ã— libopus wall-clock,
+# PEAQ-neutral).
+# Now consumed from crates.io (v0.1.23 == fork rev 77a838f + publish metadata;
+# code-identical, includes the CM1 mono-CELT fix "correct BAND_ALLOCATION row 10").
+# Dropping the git pin removes one git dep on rff's own path to crates.io
+# (crates.io rejects git dependencies). Bump the version on new fork releases.
+rusty_opus = { version = "1.0", package = "rusty-opus" }
+# lewton: pure-Rust Vorbis decoder (MIT/Apache-2.0) â€” decode only, no FFI.
+lewton = "0.10"
+# claxon: pure-Rust FLAC decoder (Apache-2.0) â€” decode only, no FFI.
+claxon = "0.4"
+# jxl-oxide: pure-Rust JPEG XL decoder (MIT/Apache-2.0) â€” decode only, no FFI.
+jxl-oxide = "0.12"
+# Optional TLS stack for `https://` input (rff-io `https` feature) â€” all
+# permissive AND pure-Rust, so it satisfies both project promises:
+#  * rustls (Apache-2.0/ISC/MIT) with NO default provider â€” `default-features =
+#    false` drops the C `aws-lc-rs` backend (and `ring`); we inject a provider.
+#  * rustls-rustcrypto (MIT/Apache) supplies a CryptoProvider built on the
+#    RustCrypto crates â€” pure Rust, but pre-1.0 and NOT yet security-audited
+#    (constant-time guarantees are weaker than ring/aws-lc-rs): the accepted
+#    "burden of immaturity" until a hardened pure-Rust provider lands.
+#  * roots come from the OS trust store via rustls-native-certs (Apache/ISC/MIT),
+#    deliberately NOT the MPL-2.0 `webpki-roots` Mozilla bundle.
+# Allocator: our own rusty_alloc (pure-Rust remake of mimalloc v2.4.5, MIT).
+# `rusty_alloc-api` is the safe GlobalAlloc surface. PROJECT CONVENTION: every
+# encoder-carrying binary in this workspace (rff-cli bins, rff-server, rff-ui,
+# codec benches/examples) sets `RustyAlloc` as `#[global_allocator]` â€” it is the
+# primary allocator. Library crates must NOT set it (that would hijack
+# downstream consumers' allocator choice); it belongs in [[bin]]/bench roots
+# only.
+#
+# Two things that trip people up when auditing this:
+#  * A `#[global_allocator]` anywhere in the linked graph applies program-wide.
+#    The four rff-cli bins declare none of their own â€” they inherit it from
+#    rff-cli/src/lib.rs. Grepping the bin files reports them as missing; they
+#    are not.
+#  * Benches and examples are SEPARATE compilation units. They link the library
+#    (which correctly declares none), so each needs its own declaration or it
+#    silently benchmarks the system heap while the shipped binary runs on
+#    rusty_alloc. Measured gap on AV2 decode: 1.38x.
+#
+# One external exception: `rusty_h264-common` declares the allocator in a
+# LIBRARY behind a default-on `global-alloc` feature. That would hard-error
+# against the declaration above, so `rff-codec-h264` pins it with
+# `default-features = false`. Do not remove that.
+rusty_alloc-api = "=2.5.0"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+rustls-native-certs = "0.8"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "off"
+codegen-units = 1
+# `unwind` (not `abort`) so decoders can contain a panic on malformed/untrusted
+# input at their API boundary (see VP9 `receive_frame`) and surface it as an
+# `Err` rather than killing the process. The unwind path is cold (hot decode
+# loops never panic), so the cost is binary size, not throughput.
+panic = "unwind"
+
+# THE JSON SWAP (rusty_json_turbo). One table converts the WHOLE graph.
+#
+# `serde_json` here is the house fork, `Remade-With-Rust/rusty_json_turbo`: a
+# performance fork whose output is byte-identical to upstream's by contract,
+# gated per commit against upstream serde_json linked in the same process --
+# bytes, `Value`, error text with line and column, float bit patterns and
+# `StreamDeserializer` offsets. Its LIBRARY is still called `serde_json`, so
+# every `use serde_json::...` line in this repository is untouched.
+#
+# WHY A PATCH AND NOT A RENAMED DEPENDENCY. Writing
+# `serde_json = { package = "rusty_json_turbo", ... }` would convert only the
+# JSON this repository calls itself, leaving every third-party copy on
+# upstream -- and the two would then be DIFFERENT TYPES, so a `Value` handed
+# across that boundary would not compile. A patch converts every copy at once
+# and leaves exactly one `Value` in the graph.
+#
+# The patch target is a shim package inside the fork named `serde_json`, which
+# exists because `[patch]` matches on PACKAGE name and the fork's package is
+# `rusty_json_turbo`. See that repository's `crates/serde_json-shim/`.
+[patch.crates-io]
+serde_json = { git = "https://github.com/Remade-With-Rust/rusty_json_turbo", branch = "master" }

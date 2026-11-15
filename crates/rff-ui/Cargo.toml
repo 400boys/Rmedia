@@ -1,0 +1,27 @@
+[package]
+name = "rff-ui"
+description = "Remade FFmpeg (Rust): Dioxus front-end (web / PWA / desktop / mobile)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+# NOT published. The Dioxus webview stack pulls MPL-2.0 crates transitively, so
+# this crate is scoped out of the `cargo-deny` no-copyleft gate — and out of
+# crates.io. The guard makes `cargo publish --workspace` skip it structurally
+# rather than relying on an `--exclude` flag being remembered.
+publish = false
+
+[[bin]]
+name = "rff-ui"
+path = "src/main.rs"
+
+[dependencies]
+rusty_alloc-api.workspace = true
+# The Dioxus desktop renderer pulls a system webview (WebView2 on Windows), so
+# this crate is excluded from the workspace default build. Build it explicitly:
+#   cargo build -p rff-ui
+# For web/mobile targets, swap the feature and use the `dx` CLI (dioxus-cli).
+dioxus = { version = "0.6", features = ["desktop"] }
+rff.workspace = true

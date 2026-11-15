@@ -1,0 +1,29 @@
+[package]
+name = "rff-server"
+description = "Remade FFmpeg (Rust): HTTP API exposing the engine for AI agents, remote clients, and the UI."
+version = "0.3.16"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["ffmpeg", "server", "http", "api", "transcode"]
+categories = ["web-programming::http-server", "multimedia"]
+
+[[bin]]
+name = "rff-server"
+path = "src/main.rs"
+
+[dependencies]
+rusty_alloc-api.workspace = true
+rff.workspace = true
+rff-core.workspace = true
+rff-auth.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

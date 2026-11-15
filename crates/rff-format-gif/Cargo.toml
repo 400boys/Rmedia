@@ -1,0 +1,17 @@
+[package]
+name = "rff-format-gif"
+description = "Remade FFmpeg (Rust): GIF single-image container (file = codec stream)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+homepage = "https://github.com/Remade-With-Rust/remade_ffmpeg_rs"
+readme = "README.md"
+keywords = ["gif", "container", "image", "demuxer", "muxer"]
+categories = ["multimedia", "multimedia::images", "parser-implementations"]
+
+[dependencies]
+rff-core.workspace = true
+rff-format.workspace = true
